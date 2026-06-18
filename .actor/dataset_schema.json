@@ -1,0 +1,23 @@
+{
+    "actorSpecification": 1,
+    "views": {
+        "overview": {
+            "title": "Trial credentials",
+            "transformation": {
+                "fields": ["status", "email", "username", "password", "host", "m3u_url", "error"]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "status": { "label": "Status" },
+                    "email": { "label": "Inbox" },
+                    "username": { "label": "Username" },
+                    "password": { "label": "Password" },
+                    "host": { "label": "Server" },
+                    "m3u_url": { "label": "M3U URL" },
+                    "error": { "label": "Error" }
+                }
+            }
+        }
+    }
+}

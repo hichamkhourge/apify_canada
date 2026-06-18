@@ -1,0 +1,10 @@
+# Apify SDK + the automation's runtime dependencies.
+apify ~= 2.0
+selenium ~= 4.27
+undetected-chromedriver ~= 3.5
+webdriver-manager ~= 4.0
+2captcha-python ~= 1.5
+python-dotenv ~= 1.0
+requests ~= 2.32
+# undetected-chromedriver imports distutils, removed from the Python 3.12 stdlib.
+setuptools >= 70.0

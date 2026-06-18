@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+storage
+apify_storage
+logs
+*.png
+*.html
+.env
+README.md

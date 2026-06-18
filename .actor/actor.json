@@ -1,0 +1,16 @@
+{
+    "actorSpecification": 1,
+    "name": "iptvv-canada-trial",
+    "title": "IPTVV Canada Trial Automation",
+    "description": "Automates IPTVV.ca free-trial checkout and extracts Xtream credentials from the confirmation email.",
+    "version": "0.1",
+    "buildTag": "latest",
+    "meta": {
+        "templateId": "python-selenium"
+    },
+    "input": "./input_schema.json",
+    "dockerfile": "../Dockerfile",
+    "storages": {
+        "dataset": "./dataset_schema.json"
+    }
+}

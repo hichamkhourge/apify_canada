@@ -1,0 +1,98 @@
+{
+    "title": "IPTVV Canada Trial Automation",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "userId": {
+            "title": "User ID",
+            "type": "integer",
+            "description": "Optional Laravel/backend account ID. Included in the webhook callback payload.",
+            "editor": "number"
+        },
+        "callbackUrl": {
+            "title": "Callback (webhook) URL",
+            "type": "string",
+            "description": "Optional URL that receives a JSON POST with the result (success or failure).",
+            "editor": "textfield"
+        },
+        "webhookAuthToken": {
+            "title": "Webhook auth token",
+            "type": "string",
+            "description": "Optional Bearer token sent in the Authorization header of the webhook callback.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "twoCaptchaApiKey": {
+            "title": "2Captcha API key",
+            "type": "string",
+            "description": "API key for the 2captcha service used to solve reCAPTCHA on checkout.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "emailBackend": {
+            "title": "Temporary email backend",
+            "type": "string",
+            "description": "Which disposable-email API to use for receiving the credentials email.",
+            "editor": "select",
+            "default": "procmail",
+            "enum": ["procmail", "mailtm"],
+            "enumTitles": ["procmail.xyz (default)", "mail.tm (fallback)"]
+        },
+        "baseUrl": {
+            "title": "IPTVV base URL",
+            "type": "string",
+            "description": "Base site URL.",
+            "editor": "textfield",
+            "default": "https://iptvv.ca"
+        },
+        "emailMaxWaitSeconds": {
+            "title": "Max email wait (seconds)",
+            "type": "integer",
+            "description": "How long to poll the inbox for the credentials email before timing out.",
+            "editor": "number",
+            "default": 2700
+        },
+        "emailPollSeconds": {
+            "title": "Email poll interval (seconds)",
+            "type": "integer",
+            "description": "Delay between inbox checks.",
+            "editor": "number",
+            "default": 30
+        },
+        "cloudflareWaitSeconds": {
+            "title": "Cloudflare wait (seconds)",
+            "type": "integer",
+            "description": "How long to wait for the checkout form past a Cloudflare/WAF interstitial.",
+            "editor": "number",
+            "default": 45
+        },
+        "iboPlayerEnabled": {
+            "title": "Save to IBO Player",
+            "type": "boolean",
+            "description": "If enabled, the extracted credentials are pushed to IBO Player via its API.",
+            "editor": "checkbox",
+            "default": false
+        },
+        "iboPlayerCookie": {
+            "title": "IBO Player cookie",
+            "type": "string",
+            "description": "Authenticated Cookie header value for iboplayer.com (required when IBO Player is enabled).",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "iboPlayerPlaylistUrlId": {
+            "title": "IBO Player playlist URL ID",
+            "type": "string",
+            "description": "current_playlist_url_id for the IBO Player savePlaylist call.",
+            "editor": "textfield"
+        },
+        "iboPlayerPlaylistName": {
+            "title": "IBO Player playlist name",
+            "type": "string",
+            "description": "Display name for the saved playlist.",
+            "editor": "textfield",
+            "default": "IPTVV Canada"
+        }
+    },
+    "required": []
+}
