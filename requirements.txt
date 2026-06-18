@@ -3,6 +3,10 @@ apify ~= 2.0
 # Pin pydantic: 2.11+ breaks crawlee (pulled in by apify) with
 # "cannot specify both default and default_factory" at import time.
 pydantic ~= 2.10.0
+# Pin browserforge: 1.2.4 renamed download.DATA_FILES -> DATA_DIRS, which
+# crawlee's browserforge workaround still calls. 1.2.3 is the only version that
+# both imports cleanly and satisfies crawlee's >=1.2.3 requirement.
+browserforge == 1.2.3
 selenium ~= 4.27
 undetected-chromedriver ~= 3.5
 webdriver-manager ~= 4.0
