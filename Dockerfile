@@ -2,6 +2,16 @@
 # https://hub.docker.com/r/apify/actor-python-selenium
 FROM apify/actor-python-selenium:3.12
 
+# libcairo2 is the native backend cairosvg needs to rasterize the IBO Player
+# login captcha. The Debian-based Apify image doesn't ship it by default, and it
+# runs as a non-root user, so switch to root for the apt install.
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libcairo2 \
+ && rm -rf /var/lib/apt/lists/*
+# Restore the image's non-root user for the dependency install and runtime.
+USER myuser
+
 # Install Python dependencies first to leverage Docker layer caching.
 COPY requirements.txt ./
 RUN echo "Python version:" \

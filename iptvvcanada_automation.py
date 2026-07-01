@@ -27,6 +27,8 @@ from selenium.webdriver.support.ui import Select, WebDriverWait
 from twocaptcha import TwoCaptcha
 from webdriver_manager.chrome import ChromeDriverManager
 
+import iboplayer_auth
+
 load_dotenv()
 
 try:
@@ -63,7 +65,11 @@ IPTVV_KNOWN_BLOCKED_IP = os.getenv("IPTVV_KNOWN_BLOCKED_IP", "").strip()
 
 # IBO Player integration configuration
 IPTVV_IBOPLAYER_ENABLED = os.getenv("IPTVV_IBOPLAYER_ENABLED", "False").lower() == "true"
-IPTVV_IBOPLAYER_COOKIE = os.getenv("IPTVV_IBOPLAYER_COOKIE", "")
+IPTVV_IBOPLAYER_COOKIE = os.getenv("IPTVV_IBOPLAYER_COOKIE", "")  # legacy; no longer used for auth
+# Device-login credentials (bearer-token auth, replacing the cookie). Fall back to
+# the shared IBOPLAYER_* device identity when the IPTVV-specific vars are unset.
+IPTVV_IBOPLAYER_MAC_ADDRESS = os.getenv("IPTVV_IBOPLAYER_MAC_ADDRESS") or os.getenv("IBOPLAYER_MAC_ADDRESS", "")
+IPTVV_IBOPLAYER_DEVICE_KEY = os.getenv("IPTVV_IBOPLAYER_DEVICE_KEY") or os.getenv("IBOPLAYER_DEVICE_KEY", "")
 IPTVV_IBOPLAYER_PLAYLIST_URL_ID = os.getenv("IPTVV_IBOPLAYER_PLAYLIST_URL_ID", "")
 IPTVV_IBOPLAYER_PLAYLIST_NAME = os.getenv("IPTVV_IBOPLAYER_PLAYLIST_NAME", "IPTVV Canada")
 IPTVV_IBOPLAYER_PLAYLIST_URL_TEMPLATE = os.getenv("IPTVV_IBOPLAYER_PLAYLIST_URL", "http://iptvvcanada.com")
@@ -1529,19 +1535,26 @@ def save_to_iboplayer(username, password, hostname, max_retries=3):
         print("[*] IBO Player integration is disabled (IPTVV_IBOPLAYER_ENABLED=False)")
         return False
 
-    if not IPTVV_IBOPLAYER_COOKIE or not IPTVV_IBOPLAYER_PLAYLIST_URL_ID:
+    if not IPTVV_IBOPLAYER_MAC_ADDRESS or not IPTVV_IBOPLAYER_DEVICE_KEY \
+            or not TWOCAPTCHA_API_KEY or not IPTVV_IBOPLAYER_PLAYLIST_URL_ID:
         print("[!] IBO Player integration enabled but missing required credentials:")
-        print(f"    - IPTVV_IBOPLAYER_COOKIE: {'Set' if IPTVV_IBOPLAYER_COOKIE else 'Missing'}")
+        print(f"    - IPTVV_IBOPLAYER_MAC_ADDRESS: {'Set' if IPTVV_IBOPLAYER_MAC_ADDRESS else 'Missing'}")
+        print(f"    - IPTVV_IBOPLAYER_DEVICE_KEY: {'Set' if IPTVV_IBOPLAYER_DEVICE_KEY else 'Missing'}")
+        print(f"    - TWOCAPTCHA_API_KEY: {'Set' if TWOCAPTCHA_API_KEY else 'Missing'}")
         print(f"    - IPTVV_IBOPLAYER_PLAYLIST_URL_ID: {'Set' if IPTVV_IBOPLAYER_PLAYLIST_URL_ID else 'Missing'}")
         return False
 
     api_url = "https://iboplayer.com/frontend/device/savePlaylist"
 
-    headers = {
-        "Content-Type": "application/json",
-        "Cookie": IPTVV_IBOPLAYER_COOKIE,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    }
+    # Authenticate with a device-login bearer token (obtained/cached by
+    # iboplayer_auth). A 401/403 below triggers a token refresh + one retry.
+    try:
+        headers = iboplayer_auth.authed_headers(
+            IPTVV_IBOPLAYER_MAC_ADDRESS, IPTVV_IBOPLAYER_DEVICE_KEY
+        )
+    except Exception as e:
+        print(f"[!] Could not obtain IBO Player bearer token: {e}")
+        return False
 
     # Construct the playlist URL using the hostname from credentials
     playlist_url = hostname.rstrip("/")
@@ -1568,6 +1581,7 @@ def save_to_iboplayer(username, password, hostname, max_retries=3):
     print(f"[*] Password: {password}")
     print("=" * 60)
 
+    relogin_attempted = False
     for attempt in range(1, max_retries + 1):
         try:
             response = requests.post(
@@ -1585,6 +1599,25 @@ def save_to_iboplayer(username, password, hostname, max_retries=3):
                 except:
                     pass
                 return True
+
+            elif response.status_code in (401, 403):
+                # Expired/invalid bearer token - refresh it once and retry.
+                print(f"[!] IBO Player auth rejected ({response.status_code}): {response.text[:200]}")
+                if not relogin_attempted:
+                    relogin_attempted = True
+                    print("[*] Refreshing bearer token and retrying...")
+                    iboplayer_auth.clear_cached_token(IPTVV_IBOPLAYER_MAC_ADDRESS)
+                    try:
+                        headers = iboplayer_auth.authed_headers(
+                            IPTVV_IBOPLAYER_MAC_ADDRESS, IPTVV_IBOPLAYER_DEVICE_KEY,
+                            force_refresh=True,
+                        )
+                    except Exception as e:
+                        print(f"[!] Re-login failed: {e}")
+                        return False
+                    continue
+                print("[!] Re-login already attempted - giving up.")
+                return False
 
             elif 400 <= response.status_code < 500:
                 # Client error - don't retry, configuration issue

@@ -74,9 +74,22 @@
             "default": false
         },
         "iboPlayerCookie": {
-            "title": "IBO Player cookie",
+            "title": "IBO Player cookie (legacy)",
             "type": "string",
-            "description": "Authenticated Cookie header value for iboplayer.com (required when IBO Player is enabled).",
+            "description": "Legacy Cookie header value for iboplayer.com. No longer used for auth; the actor now logs in via MAC + device key below.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "iboPlayerMacAddress": {
+            "title": "IBO Player device MAC address",
+            "type": "string",
+            "description": "Device MAC (e.g. b8:13:a0:e0:6e:83) used to log in and obtain a bearer token (required when IBO Player is enabled).",
+            "editor": "textfield"
+        },
+        "iboPlayerDeviceKey": {
+            "title": "IBO Player device key",
+            "type": "string",
+            "description": "Device key/PIN used with the MAC to log in to iboplayer.com (required when IBO Player is enabled).",
             "editor": "textfield",
             "isSecret": true
         },

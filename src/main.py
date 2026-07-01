@@ -21,6 +21,8 @@ _ENV_MAP = {
     "emailPollSeconds": "IPTVV_EMAIL_POLL_SECONDS",
     "cloudflareWaitSeconds": "IPTVV_CLOUDFLARE_WAIT_SECONDS",
     "iboPlayerCookie": "IPTVV_IBOPLAYER_COOKIE",
+    "iboPlayerMacAddress": "IPTVV_IBOPLAYER_MAC_ADDRESS",
+    "iboPlayerDeviceKey": "IPTVV_IBOPLAYER_DEVICE_KEY",
     "iboPlayerPlaylistUrlId": "IPTVV_IBOPLAYER_PLAYLIST_URL_ID",
     "iboPlayerPlaylistName": "IPTVV_IBOPLAYER_PLAYLIST_NAME",
 }
