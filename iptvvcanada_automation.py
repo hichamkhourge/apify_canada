@@ -13,6 +13,7 @@ import os
 import random
 import re
 import string
+import subprocess
 import time
 from datetime import datetime, timezone
 import requests
@@ -58,6 +59,7 @@ IPTVV_EMAIL_BACKEND = os.getenv("IPTVV_EMAIL_BACKEND", "procmail").strip().lower
 PROCMAIL_API_BASE = os.getenv("PROCMAIL_API_BASE", "https://api.procmail.xyz").rstrip("/")
 AUTO_EXIT = os.getenv("AUTO_EXIT", "True").lower() == "true"
 IPTVV_PAGE_LOAD_RETRIES = int(os.getenv("IPTVV_PAGE_LOAD_RETRIES", "2"))
+IPTVV_TRIAL_PRODUCT_ID = os.getenv("IPTVV_TRIAL_PRODUCT_ID", "7758")
 IPTVV_CLOUDFLARE_WAIT_SECONDS = int(os.getenv("IPTVV_CLOUDFLARE_WAIT_SECONDS", "45"))
 IPTVV_DEBUG_DIR = os.getenv("IPTVV_DEBUG_DIR", "/app/logs")
 IPTVV_PROXY_CHECK_URL = os.getenv("IPTVV_PROXY_CHECK_URL", "https://api.ipify.org")
@@ -468,6 +470,22 @@ def get_random_user_agent():
     return random.choice(user_agents)
 
 
+def get_chrome_major_version(chrome_binary):
+    """Return the installed Chrome major version, or None if undetectable."""
+    override = os.getenv("CHROME_VERSION_MAIN", "").strip()
+    if override.isdigit():
+        return int(override)
+    if not chrome_binary:
+        return None
+    try:
+        output = subprocess.check_output([chrome_binary, "--version"], text=True, timeout=15)
+        match = re.search(r"(\d+)\.", output)
+        return int(match.group(1)) if match else None
+    except Exception as e:
+        print(f"[!] Could not detect Chrome version from {chrome_binary}: {e}")
+        return None
+
+
 def get_driver():
     """Initialize Chrome WebDriver with anti-detection options (undetected-chromedriver).
 
@@ -536,10 +554,17 @@ def get_driver():
         options.binary_location = chrome_binary
         print(f"[*] Using Chrome binary: {chrome_binary}")
 
+    # Pin version_main to the installed Chrome; without it undetected-chromedriver
+    # downloads the latest driver, which can be one major ahead of the browser
+    # bundled in the Apify base image (e.g. driver 150 vs Chrome 149).
+    version_main = get_chrome_major_version(chrome_binary)
+    if version_main:
+        print(f"[*] Detected Chrome major version: {version_main}")
+
     # Use undetected-chromedriver (no need for chromedriver path, it manages itself)
     try:
         print("[*] Initializing undetected-chromedriver...")
-        driver = uc.Chrome(options=options, use_subprocess=False)
+        driver = uc.Chrome(options=options, use_subprocess=False, version_main=version_main)
         print("[OK] undetected-chromedriver initialized successfully")
     except Exception as e:
         print(f"[!] Failed to initialize undetected-chromedriver: {e}")
@@ -798,7 +823,7 @@ def preflight_checkout_access():
             print("[*] Browser IP matches server IP; this is expected for full-system VPN egress.")
 
         print("[*] Seeding free-trial cart for checkout preflight...")
-        driver.get(f"{IPTVV_BASE_URL}/?add-to-cart=7758")
+        driver.get(f"{IPTVV_BASE_URL}/?add-to-cart={IPTVV_TRIAL_PRODUCT_ID}")
         WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(5)
 
@@ -904,8 +929,13 @@ def wait_for_real_checkout_page(driver, context, timeout=30):
         )
 
     artifacts = save_page_debug_artifacts(driver, "checkout_not_loaded")
+    empty_cart_hint = (
+        " (page shows an empty cart - the trial product was never added)"
+        if "your cart is currently empty" in page_text_lower(driver)
+        else ""
+    )
     raise RuntimeError(
-        f"IPTVV checkout form did not load after {context}. "
+        f"IPTVV checkout form did not load after {context}{empty_cart_hint}. "
         f"Current URL: {driver.current_url}; title: {driver.title}; "
         f"debug HTML: {artifacts.get('html', 'not saved')}; "
         f"screenshot: {artifacts.get('screenshot', 'not saved')}"
@@ -942,88 +972,96 @@ def generate_random_user_data():
 # IPTVV.ca Automation Functions
 # ═══════════════════════════════════════════════════════════
 
+def find_add_to_cart_control(driver, timeout=10):
+    """Find the control that actually adds the trial product to the cart.
+
+    Prefer anchors whose href performs the WooCommerce add-to-cart (the
+    "START MY FREE TRIAL" button); matching by label alone can hit the
+    "Get Free Trial" link, which only opens the /iptv-free-trial/ landing
+    page without touching the cart.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        for el in driver.find_elements(By.CSS_SELECTOR, "a[href*='add-to-cart']"):
+            if el.is_displayed() and el.is_enabled():
+                return el
+        time.sleep(0.5)
+    return find_clickable_by_text(
+        driver,
+        ["start my free trial", "start free trial", "add to cart"],
+        timeout=10,
+    )
+
+
+def cart_has_items(driver):
+    """Load the cart page and report whether it contains at least one item."""
+    driver.get(IPTVV_CART_URL)
+    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    time.sleep(2)
+    if driver.find_elements(By.CSS_SELECTOR, ".cart_item"):
+        return True
+    if "your cart is currently empty" in page_text_lower(driver):
+        return False
+    # Unknown layout: proceed and let the checkout verification decide.
+    return True
+
+
+def open_checkout_and_verify(driver, context):
+    """Navigate to the checkout page and wait for the real WooCommerce form."""
+    checkout_url = f"{IPTVV_BASE_URL}/checkout/"
+    print(f"[*] Navigating to checkout: {checkout_url}")
+    driver.get(checkout_url)
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    time.sleep(5)
+
+    # Wait for document to be fully ready
+    for _ in range(10):
+        if driver.execute_script("return document.readyState") == "complete":
+            break
+        time.sleep(1)
+
+    print(f"[*] Checkout URL: {driver.current_url}")
+    print(f"[*] Page title: {driver.title}")
+    wait_for_real_checkout_page(driver, context, timeout=IPTVV_CLOUDFLARE_WAIT_SECONDS)
+
+
 def navigate_to_cart_and_get_free_trial(driver):
-    """Navigate to cart and add free trial product to cart (WooCommerce flow)."""
+    """Add the free-trial product to the cart and open checkout (WooCommerce flow)."""
     print(f"[*] Navigating to IPTVV cart: {IPTVV_CART_URL}")
     driver.get(IPTVV_CART_URL)
     WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     time.sleep(2)
     print(f"[*] Current URL: {driver.current_url}")
 
-    # Look for "Get Free Trial" link/button and click it to add product to cart
-    print("[*] Looking for 'Get Free Trial' link...")
+    print("[*] Looking for the add-to-cart trial button...")
     try:
-        trial_button = find_clickable_by_text(
-            driver,
-            ["get free trial", "free trial", "start free trial", "trial"],
-            timeout=10
-        )
-        print(f"[OK] Found element: {trial_button.text}")
+        trial_button = find_add_to_cart_control(driver, timeout=10)
+        label = trial_button.text or trial_button.get_attribute("href")
+        print(f"[OK] Found element: {label}")
         safe_click(driver, trial_button)
-        print("[OK] Clicked 'Get Free Trial' - adding product to cart...")
-
-        # Wait for product to be added to cart (WooCommerce usually redirects or shows confirmation)
+        print("[OK] Clicked trial button - adding product to cart...")
         time.sleep(5)
         print(f"[*] After click URL: {driver.current_url}")
-
-        # Now navigate to checkout page
-        checkout_url = f"{IPTVV_BASE_URL}/checkout/"
-        print(f"[*] Navigating to checkout: {checkout_url}")
-        driver.get(checkout_url)
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(5)
-
-        # Wait for document to be fully ready
-        for i in range(10):
-            ready_state = driver.execute_script("return document.readyState")
-            if ready_state == "complete":
-                break
-            time.sleep(1)
-
-        print(f"[*] Checkout URL: {driver.current_url}")
-        print(f"[*] Page title: {driver.title}")
-        wait_for_real_checkout_page(driver, "free-trial cart flow", timeout=IPTVV_CLOUDFLARE_WAIT_SECONDS)
-
-        # Verify we're on checkout page
-        if "checkout" not in driver.current_url.lower():
-            print("[!] WARNING: Not on checkout page after navigation")
-            # Try alternative: look for "View Cart" or "Proceed to Checkout" button
-            try:
-                checkout_btn = find_clickable_by_text(driver, ["proceed to checkout", "checkout", "view cart"], timeout=10)
-                safe_click(driver, checkout_btn)
-                time.sleep(3)
-                print(f"[*] After clicking checkout button: {driver.current_url}")
-                wait_for_real_checkout_page(driver, "checkout button click", timeout=IPTVV_CLOUDFLARE_WAIT_SECONDS)
-            except:
-                pass
-
     except TimeoutError:
-        print("[!] 'Get Free Trial' link not found")
-        # Try direct URL for adding product to cart
-        print("[*] Trying direct add-to-cart URL...")
-        driver.get(f"{IPTVV_BASE_URL}/?add-to-cart=7758")
+        print("[!] Add-to-cart trial button not found")
+
+    if not cart_has_items(driver):
+        print("[*] Cart is still empty; trying direct add-to-cart URL...")
+        driver.get(f"{IPTVV_BASE_URL}/?add-to-cart={IPTVV_TRIAL_PRODUCT_ID}")
         time.sleep(8)  # Wait longer for product to be added
         print(f"[*] After add-to-cart URL: {driver.current_url}")
+        if not cart_has_items(driver):
+            print("[!] Cart still looks empty after direct add-to-cart; continuing to checkout anyway")
 
-        # Navigate to checkout
-        checkout_url = f"{IPTVV_BASE_URL}/checkout/"
-        print(f"[*] Navigating to checkout: {checkout_url}")
-        driver.get(checkout_url)
-
-        # Wait for page to fully load including JavaScript
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(8)  # Extra time for WooCommerce JavaScript to initialize
-
-        # Wait for document to be fully ready
-        for i in range(10):
-            ready_state = driver.execute_script("return document.readyState")
-            if ready_state == "complete":
-                break
-            time.sleep(1)
-
-        print(f"[*] Checkout URL: {driver.current_url}")
-        print(f"[*] Page title: {driver.title}")
-        wait_for_real_checkout_page(driver, "direct add-to-cart flow", timeout=IPTVV_CLOUDFLARE_WAIT_SECONDS)
+    try:
+        open_checkout_and_verify(driver, "free-trial cart flow")
+    except RuntimeError:
+        if "/cart" not in driver.current_url:
+            raise
+        print("[!] Checkout bounced back to the cart; re-adding trial product and retrying once...")
+        driver.get(f"{IPTVV_BASE_URL}/?add-to-cart={IPTVV_TRIAL_PRODUCT_ID}")
+        time.sleep(8)
+        open_checkout_and_verify(driver, "direct add-to-cart retry")
 
 
 def select_full_channel_package(driver):
@@ -1592,13 +1630,25 @@ def save_to_iboplayer(username, password, hostname, max_retries=3):
             )
 
             if response.status_code == 200:
-                print(f"[OK] Playlist saved to IBO Player successfully!")
+                # HTTP 200 alone is NOT success: IBO Player returns
+                # {"status":"error"} in the body when it rejects the save
+                # (e.g. the current_playlist_url_id isn't owned by this device).
                 try:
                     response_data = response.json()
-                    print(f"[*] IBO Player response: {response_data}")
-                except:
-                    pass
-                return True
+                except Exception:
+                    response_data = None
+                print(f"[*] IBO Player response: {response_data if response_data is not None else response.text[:300]}")
+
+                if isinstance(response_data, dict) and response_data.get("status") == "success":
+                    print(f"[OK] Playlist saved to IBO Player successfully!")
+                    return True
+
+                print("[!] IBO Player rejected the save (status != success).")
+                print("[!] Most common cause: IPTVV_IBOPLAYER_PLAYLIST_URL_ID is not a "
+                      "playlist owned by the logged-in device "
+                      f"({IPTVV_IBOPLAYER_MAC_ADDRESS}). Verify the device MAC/key and "
+                      "playlist URL ID match the same IBO Player device.")
+                return False
 
             elif response.status_code in (401, 403):
                 # Expired/invalid bearer token - refresh it once and retry.
