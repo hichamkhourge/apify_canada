@@ -8,6 +8,7 @@ Install deps: pip install selenium webdriver-manager 2captcha-python python-dote
 """
 import argparse
 import html
+import imaplib
 import json
 import os
 import random
@@ -52,11 +53,18 @@ EMAIL_POLL_SECONDS = int(os.getenv("IPTVV_EMAIL_POLL_SECONDS", "30"))
 EMAIL_MAX_WAIT_SECONDS = int(os.getenv("IPTVV_EMAIL_MAX_WAIT_SECONDS", "2700"))  # 45 minutes
 
 # Email backend:
-#   "procmail" (default) — api.procmail.xyz REST API (powers 8gwifi.org/temp-email.jsp).
+#   "gmail" (default) — real Gmail inbox with a unique plus-addressed alias per run
+#                (e.g. wdmonitoring+55455@gmail.com), polled over IMAP with an app
+#                password. Disposable-mail domains get dropped by IPTVV's mailer;
+#                a real Gmail address does not.
+#   "procmail"        — api.procmail.xyz REST API (powers 8gwifi.org/temp-email.jsp).
 #                Pure HTTP: GET /generate for an address, GET /inbox/{addr} for messages.
-#   "mailtm"             — legacy mail.tm REST API (kept as a fallback).
-IPTVV_EMAIL_BACKEND = os.getenv("IPTVV_EMAIL_BACKEND", "procmail").strip().lower()
+#   "mailtm"          — legacy mail.tm REST API (kept as a fallback).
+IPTVV_EMAIL_BACKEND = os.getenv("IPTVV_EMAIL_BACKEND", "gmail").strip().lower()
 PROCMAIL_API_BASE = os.getenv("PROCMAIL_API_BASE", "https://api.procmail.xyz").rstrip("/")
+IPTVV_GMAIL_ADDRESS = os.getenv("IPTVV_GMAIL_ADDRESS", "wdmonitoring@gmail.com").strip()
+IPTVV_GMAIL_APP_PASSWORD = os.getenv("IPTVV_GMAIL_APP_PASSWORD", "").strip()
+IPTVV_GMAIL_IMAP_HOST = os.getenv("IPTVV_GMAIL_IMAP_HOST", "imap.gmail.com")
 AUTO_EXIT = os.getenv("AUTO_EXIT", "True").lower() == "true"
 IPTVV_PAGE_LOAD_RETRIES = int(os.getenv("IPTVV_PAGE_LOAD_RETRIES", "2"))
 IPTVV_TRIAL_PRODUCT_ID = os.getenv("IPTVV_TRIAL_PRODUCT_ID", "7758")
@@ -424,6 +432,151 @@ def _wait_for_credentials_email_procmail(address, max_wait_seconds=EMAIL_MAX_WAI
 
 
 # ═══════════════════════════════════════════════════════════
+# Gmail plus-addressing backend — real inbox polled over IMAP
+#
+# Each run checks out with a unique alias like wdmonitoring+55455@gmail.com;
+# Gmail delivers everything to the base IPTVV_GMAIL_ADDRESS inbox, which we
+# poll over IMAP using a Google app password (IPTVV_GMAIL_APP_PASSWORD).
+# Unlike disposable-mail domains, a real Gmail address is never dropped by
+# the store's mailer.
+# ═══════════════════════════════════════════════════════════
+def _gmail_imap_login():
+    """Open an authenticated IMAP connection to the Gmail account."""
+    if not IPTVV_GMAIL_APP_PASSWORD:
+        raise RuntimeError(
+            f"IPTVV_GMAIL_APP_PASSWORD is not set; the gmail backend needs a "
+            f"Google app password for {IPTVV_GMAIL_ADDRESS}"
+        )
+    imap = imaplib.IMAP4_SSL(IPTVV_GMAIL_IMAP_HOST)
+    imap.login(IPTVV_GMAIL_ADDRESS, IPTVV_GMAIL_APP_PASSWORD)
+    return imap
+
+
+def create_gmail_alias():
+    """Build a unique plus-addressed alias and verify the IMAP login up front.
+
+    Returns the alias address (all mail still lands in IPTVV_GMAIL_ADDRESS),
+    or None on failure.
+    """
+    try:
+        if "@" not in IPTVV_GMAIL_ADDRESS:
+            raise RuntimeError(f"invalid IPTVV_GMAIL_ADDRESS: {IPTVV_GMAIL_ADDRESS!r}")
+        imap = _gmail_imap_login()
+        try:
+            imap.logout()
+        except Exception:
+            pass
+        local, domain = IPTVV_GMAIL_ADDRESS.split("@", 1)
+        suffix = f"{int(time.time())}{random.randint(100, 999)}"
+        alias = f"{local}+{suffix}@{domain}"
+        print(f"[OK] Gmail alias created: {alias}")
+        return alias
+    except Exception as exc:
+        print(f"[!] Failed to prepare Gmail alias: {exc}")
+        return None
+
+
+def _gmail_message_to_dict(raw_bytes, msg_id):
+    """Parse a raw RFC822 message into the shared normalized message shape."""
+    import email as email_lib
+    from email.utils import parseaddr
+
+    msg = email_lib.message_from_bytes(raw_bytes)
+    subject = _decode_mime_header(msg.get("Subject", ""))
+    from_addr = parseaddr(msg.get("From", ""))[1]
+
+    text_body, html_body = "", ""
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        try:
+            payload = part.get_payload(decode=True) or b""
+            body = payload.decode(part.get_content_charset() or "utf-8", "replace")
+        except Exception:
+            continue
+        if ctype == "text/plain" and not text_body:
+            text_body = body
+        elif ctype == "text/html" and not html_body:
+            html_body = body
+
+    return {
+        "id": msg_id,
+        "subject": subject,
+        "from": {"address": from_addr},
+        "text": text_body,
+        "html": [html_body] if html_body else [],
+    }
+
+
+def get_gmail_messages(alias):
+    """Fetch messages addressed to the alias (INBOX + Spam), normalized.
+
+    Bodies come back inline, so fetch_full stays the identity function like
+    the procmail backend.
+    """
+    try:
+        imap = _gmail_imap_login()
+    except Exception as exc:
+        print(f"[!] Failed to connect to Gmail IMAP: {exc}")
+        return []
+
+    messages = []
+    try:
+        for folder in ('INBOX', '"[Gmail]/Spam"'):
+            try:
+                status, _ = imap.select(folder, readonly=True)
+                if status != "OK":
+                    continue
+                status, data = imap.search(None, "TO", f'"{alias}"')
+                if status != "OK" or not data or not data[0]:
+                    continue
+                for num in data[0].split():
+                    status, fetched = imap.fetch(num, "(RFC822)")
+                    if status != "OK" or not fetched or not fetched[0]:
+                        continue
+                    messages.append(
+                        _gmail_message_to_dict(fetched[0][1], f"{folder}-{num.decode()}")
+                    )
+            except Exception as exc:
+                print(f"[!] Failed to read Gmail folder {folder}: {exc}")
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+    return messages
+
+
+def _wait_for_credentials_email_gmail(alias, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
+    """Poll the Gmail inbox over IMAP until the credentials email arrives."""
+    print(f"[*] Waiting for credentials email (max {max_wait_seconds}s / {max_wait_seconds//60} minutes)...")
+    deadline = time.time() + max_wait_seconds
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        remaining = int(deadline - time.time())
+        print(f"[*] Checking gmail inbox (attempt {attempt}, {remaining}s remaining)...")
+
+        messages = get_gmail_messages(alias)
+        result = _scan_messages_for_credentials(messages, fetch_full=lambda m: m)
+        if result:
+            return result
+
+        if messages:
+            print(f"[*] Found {len(messages)} email(s), but credentials email not yet received")
+        else:
+            print("[*] Inbox is empty")
+
+        print(f"[*] Waiting {EMAIL_POLL_SECONDS}s before next check...")
+        time.sleep(EMAIL_POLL_SECONDS)
+
+    print(f"[!] Timeout: Credentials email not received after {max_wait_seconds}s")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
 # Email backend dispatchers (backend-agnostic entry points used by main())
 # ═══════════════════════════════════════════════════════════
 def create_email_session(driver=None):
@@ -438,11 +591,17 @@ def create_email_session(driver=None):
             return None
         return {"backend": "mailtm", "address": address, "password": password, "token": auth_token}
 
-    # Default: procmail.xyz (8gwifi.org) REST API.
-    address = create_procmail_inbox()
-    if not address:
+    if IPTVV_EMAIL_BACKEND == "procmail":
+        address = create_procmail_inbox()
+        if not address:
+            return None
+        return {"backend": "procmail", "address": address}
+
+    # Default: Gmail plus-addressing (real inbox polled over IMAP).
+    alias = create_gmail_alias()
+    if not alias:
         return None
-    return {"backend": "procmail", "address": address}
+    return {"backend": "gmail", "address": alias}
 
 
 def wait_for_credentials_email(driver, session, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
@@ -450,7 +609,9 @@ def wait_for_credentials_email(driver, session, max_wait_seconds=EMAIL_MAX_WAIT_
     backend = (session or {}).get("backend")
     if backend == "mailtm":
         return _wait_for_credentials_email_mailtm(session["token"], max_wait_seconds)
-    return _wait_for_credentials_email_procmail(session["address"], max_wait_seconds)
+    if backend == "procmail":
+        return _wait_for_credentials_email_procmail(session["address"], max_wait_seconds)
+    return _wait_for_credentials_email_gmail(session["address"], max_wait_seconds)
 
 
 # ═══════════════════════════════════════════════════════════

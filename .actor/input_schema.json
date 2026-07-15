@@ -30,13 +30,27 @@
             "isSecret": true
         },
         "emailBackend": {
-            "title": "Temporary email backend",
+            "title": "Email backend",
             "type": "string",
-            "description": "Which disposable-email API to use for receiving the credentials email.",
+            "description": "Which mailbox to use for receiving the credentials email. 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
             "editor": "select",
-            "default": "procmail",
-            "enum": ["procmail", "mailtm"],
-            "enumTitles": ["procmail.xyz (default)", "mail.tm (fallback)"]
+            "default": "gmail",
+            "enum": ["gmail", "procmail", "mailtm"],
+            "enumTitles": ["Gmail plus-addressing (default)", "procmail.xyz", "mail.tm (fallback)"]
+        },
+        "gmailAddress": {
+            "title": "Gmail address",
+            "type": "string",
+            "description": "Base Gmail address for the 'gmail' backend; each run checks out with a unique plus-addressed alias of it.",
+            "editor": "textfield",
+            "default": "wdmonitoring@gmail.com"
+        },
+        "gmailAppPassword": {
+            "title": "Gmail app password",
+            "type": "string",
+            "description": "Google app password for the Gmail address (Google Account → Security → 2-Step Verification → App passwords). Required for the 'gmail' backend; used for IMAP polling only.",
+            "editor": "textfield",
+            "isSecret": true
         },
         "baseUrl": {
             "title": "IPTVV base URL",
