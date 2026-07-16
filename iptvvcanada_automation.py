@@ -53,14 +53,18 @@ EMAIL_POLL_SECONDS = int(os.getenv("IPTVV_EMAIL_POLL_SECONDS", "30"))
 EMAIL_MAX_WAIT_SECONDS = int(os.getenv("IPTVV_EMAIL_MAX_WAIT_SECONDS", "2700"))  # 45 minutes
 
 # Email backend:
-#   "gmail" (default) — real Gmail inbox with a unique plus-addressed alias per run
+#   "tmaily" (default) — tmaily.com same-origin REST API. GET /generate for an
+#                address (session cookie binds the inbox), GET /emails?address=
+#                for messages. Inboxes auto-expire after 24h.
+#   "gmail"           — real Gmail inbox with a unique plus-addressed alias per run
 #                (e.g. wdmonitoring+55455@gmail.com), polled over IMAP with an app
 #                password. Disposable-mail domains get dropped by IPTVV's mailer;
 #                a real Gmail address does not.
 #   "procmail"        — api.procmail.xyz REST API (powers 8gwifi.org/temp-email.jsp).
 #                Pure HTTP: GET /generate for an address, GET /inbox/{addr} for messages.
 #   "mailtm"          — legacy mail.tm REST API (kept as a fallback).
-IPTVV_EMAIL_BACKEND = os.getenv("IPTVV_EMAIL_BACKEND", "gmail").strip().lower()
+IPTVV_EMAIL_BACKEND = os.getenv("IPTVV_EMAIL_BACKEND", "tmaily").strip().lower()
+TMAILY_API_BASE = os.getenv("TMAILY_API_BASE", "https://tmaily.com").rstrip("/")
 PROCMAIL_API_BASE = os.getenv("PROCMAIL_API_BASE", "https://api.procmail.xyz").rstrip("/")
 IPTVV_GMAIL_ADDRESS = os.getenv("IPTVV_GMAIL_ADDRESS", "wdmonitoring@gmail.com").strip()
 IPTVV_GMAIL_APP_PASSWORD = os.getenv("IPTVV_GMAIL_APP_PASSWORD", "").strip()
@@ -432,6 +436,184 @@ def _wait_for_credentials_email_procmail(address, max_wait_seconds=EMAIL_MAX_WAI
 
 
 # ═══════════════════════════════════════════════════════════
+# tmaily.com email backend — same-origin REST API behind the SPA
+#
+# tmaily.com's front-end talks to its own origin:
+#   GET /generate                    -> {"address": "xxx@10timer.com"}; the
+#                                       TMaily_sid session cookie binds the
+#                                       inbox, so all calls must share one
+#                                       requests.Session.
+#   GET /emails?address={addr}       -> JSON array of message summaries
+#                                       ({id, subject, from, date, ...}).
+#   GET /emails?address={addr}&id={id} / GET /message/{id}
+#                                    -> fallbacks for the full body when the
+#                                       list entry doesn't carry it inline.
+# The site loads Cloudflare Turnstile but /generate works without a token;
+# when it doesn't, the API answers with an error mentioning "turnstile".
+# ═══════════════════════════════════════════════════════════
+_TMAILY_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+_tmaily_http = None
+
+
+def _tmaily_session():
+    """Lazily create the shared requests.Session carrying the TMaily_sid cookie."""
+    global _tmaily_http
+    if _tmaily_http is None:
+        _tmaily_http = requests.Session()
+        _tmaily_http.headers.update({"User-Agent": _TMAILY_UA})
+    return _tmaily_http
+
+
+def create_tmaily_inbox():
+    """Generate a disposable address via tmaily.com.
+
+    Returns the email address string, or None on failure. Passes force=true so
+    every call mints a fresh address instead of returning the session's
+    current one.
+    """
+    try:
+        resp = _tmaily_session().get(
+            f"{TMAILY_API_BASE}/generate", params={"force": "true"}, timeout=15
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and "turnstile" in str(data.get("error", "")).lower():
+            raise RuntimeError("tmaily.com now requires a Turnstile token for /generate")
+        address = (data or {}).get("address", "")
+        if "@" not in address:
+            raise RuntimeError(f"unexpected /generate response: {str(data)[:120]!r}")
+        print(f"[OK] tmaily inbox created: {address}")
+        return address
+    except Exception as exc:
+        print(f"[!] Failed to create tmaily inbox: {exc}")
+        return None
+
+
+def _tmaily_normalize_message(item):
+    """Map a raw tmaily message dict onto the shared normalized shape."""
+    from email.utils import parseaddr
+
+    raw_from = item.get("from", "")
+    if isinstance(raw_from, dict):
+        from_addr = raw_from.get("address", "") or raw_from.get("email", "")
+    else:
+        from_addr = parseaddr(str(raw_from))[1] or str(raw_from)
+
+    text_body = ""
+    html_body = ""
+    for key in ("text", "textBody", "text_body", "plainText"):
+        if item.get(key):
+            text_body = _decode_qp(str(item[key]))
+            break
+    for key in ("html", "htmlBody", "html_body", "body", "content"):
+        if item.get(key):
+            value = item[key]
+            if isinstance(value, list):
+                value = " ".join(str(v) for v in value)
+            html_body = _decode_qp(str(value))
+            break
+
+    return {
+        "id": str(item.get("id", "")),
+        "subject": _decode_mime_header(item.get("subject", "")),
+        "from": {"address": from_addr},
+        "text": text_body,
+        "html": [html_body] if html_body else [],
+    }
+
+
+def get_tmaily_messages(address):
+    """Fetch the tmaily inbox, normalized to the shared message shape."""
+    try:
+        resp = _tmaily_session().get(
+            f"{TMAILY_API_BASE}/emails",
+            params={"address": address},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json() or []
+    except Exception as exc:
+        print(f"[!] Failed to fetch tmaily inbox: {exc}")
+        return []
+    if not isinstance(data, list):
+        data = data.get("emails", []) if isinstance(data, dict) else []
+    return [_tmaily_normalize_message(item) for item in data]
+
+
+def _tmaily_fetch_full(address, msg):
+    """Return a message with a body, fetching it separately if the list entry had none.
+
+    Tries GET /emails?address=&id= first, then falls back to scraping the
+    server-rendered /message/{id} page; extract_credentials_from_email()
+    strips HTML tags itself, so raw page HTML is an acceptable body.
+    """
+    if msg.get("text") or msg.get("html"):
+        return msg
+
+    session = _tmaily_session()
+    msg_id = msg.get("id", "")
+    try:
+        resp = session.get(
+            f"{TMAILY_API_BASE}/emails",
+            params={"address": address, "id": msg_id},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            data = data[0]
+        if isinstance(data, dict):
+            full = _tmaily_normalize_message(data)
+            if full.get("text") or full.get("html"):
+                full["subject"] = full["subject"] or msg.get("subject", "")
+                full["from"] = full["from"] if full["from"]["address"] else msg.get("from", {})
+                return full
+    except Exception as exc:
+        print(f"[!] Failed to fetch tmaily message {msg_id} by id: {exc}")
+
+    try:
+        resp = session.get(f"{TMAILY_API_BASE}/message/{msg_id}", timeout=15)
+        resp.raise_for_status()
+        page = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", resp.text, flags=re.I | re.S)
+        return {**msg, "html": [page]}
+    except Exception as exc:
+        print(f"[!] Failed to fetch tmaily message page for {msg_id}: {exc}")
+    return msg
+
+
+def _wait_for_credentials_email_tmaily(address, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
+    """Poll the tmaily inbox until the credentials email arrives."""
+    print(f"[*] Waiting for credentials email (max {max_wait_seconds}s / {max_wait_seconds//60} minutes)...")
+    deadline = time.time() + max_wait_seconds
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        remaining = int(deadline - time.time())
+        print(f"[*] Checking tmaily inbox (attempt {attempt}, {remaining}s remaining)...")
+
+        messages = get_tmaily_messages(address)
+        result = _scan_messages_for_credentials(
+            messages, fetch_full=lambda m: _tmaily_fetch_full(address, m)
+        )
+        if result:
+            return result
+
+        if messages:
+            print(f"[*] Found {len(messages)} email(s), but credentials email not yet received")
+        else:
+            print("[*] Inbox is empty")
+
+        print(f"[*] Waiting {EMAIL_POLL_SECONDS}s before next check...")
+        time.sleep(EMAIL_POLL_SECONDS)
+
+    print(f"[!] Timeout: Credentials email not received after {max_wait_seconds}s")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
 # Gmail plus-addressing backend — real inbox polled over IMAP
 #
 # Each run checks out with a unique alias like wdmonitoring+55455@gmail.com;
@@ -450,6 +632,24 @@ def _gmail_imap_login():
     imap = imaplib.IMAP4_SSL(IPTVV_GMAIL_IMAP_HOST)
     imap.login(IPTVV_GMAIL_ADDRESS, IPTVV_GMAIL_APP_PASSWORD)
     return imap
+
+
+def verify_gmail_login():
+    """Raise early with a clear error if the Gmail IMAP login is broken."""
+    try:
+        imap = _gmail_imap_login()
+        try:
+            imap.logout()
+        except Exception:
+            pass
+        print(f"[OK] Gmail IMAP login verified for {IPTVV_GMAIL_ADDRESS}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Gmail IMAP login failed for {IPTVV_GMAIL_ADDRESS}: {exc}. "
+            "IPTVV_GMAIL_APP_PASSWORD must be a Google app password "
+            "(myaccount.google.com/apppasswords, requires 2-Step Verification), "
+            "not the regular account password."
+        ) from exc
 
 
 def create_gmail_alias():
@@ -597,11 +797,17 @@ def create_email_session(driver=None):
             return None
         return {"backend": "procmail", "address": address}
 
-    # Default: Gmail plus-addressing (real inbox polled over IMAP).
-    alias = create_gmail_alias()
-    if not alias:
+    if IPTVV_EMAIL_BACKEND == "gmail":
+        alias = create_gmail_alias()
+        if not alias:
+            return None
+        return {"backend": "gmail", "address": alias}
+
+    # Default: tmaily.com disposable inbox.
+    address = create_tmaily_inbox()
+    if not address:
         return None
-    return {"backend": "gmail", "address": alias}
+    return {"backend": "tmaily", "address": address}
 
 
 def wait_for_credentials_email(driver, session, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
@@ -611,7 +817,9 @@ def wait_for_credentials_email(driver, session, max_wait_seconds=EMAIL_MAX_WAIT_
         return _wait_for_credentials_email_mailtm(session["token"], max_wait_seconds)
     if backend == "procmail":
         return _wait_for_credentials_email_procmail(session["address"], max_wait_seconds)
-    return _wait_for_credentials_email_gmail(session["address"], max_wait_seconds)
+    if backend == "gmail":
+        return _wait_for_credentials_email_gmail(session["address"], max_wait_seconds)
+    return _wait_for_credentials_email_tmaily(session["address"], max_wait_seconds)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1940,6 +2148,11 @@ def run_automation():
     try:
         print("\n[*] Creating trial using public IP (direct connection)")
         print("=" * 60)
+
+        # Fail fast on Gmail credential problems before spending a browser
+        # session (checkout + captcha) that a broken inbox login would waste.
+        if IPTVV_EMAIL_BACKEND == "gmail":
+            verify_gmail_login()
 
         # Step 1: Initialize browser and confirm IPTVV checkout is reachable.
         driver = get_driver()
