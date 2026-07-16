@@ -32,11 +32,11 @@
         "emailBackend": {
             "title": "Email backend",
             "type": "string",
-            "description": "Which mailbox to use for receiving the credentials email. 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
+            "description": "Which mailbox to use for receiving the credentials email. 'tmaily' allocates a disposable tmaily.com inbox per run; 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
             "editor": "select",
-            "default": "gmail",
-            "enum": ["gmail", "procmail", "mailtm"],
-            "enumTitles": ["Gmail plus-addressing (default)", "procmail.xyz", "mail.tm (fallback)"]
+            "default": "tmaily",
+            "enum": ["tmaily", "gmail", "procmail", "mailtm"],
+            "enumTitles": ["tmaily.com (default)", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
         },
         "gmailAddress": {
             "title": "Gmail address",
