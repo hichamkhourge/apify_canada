@@ -38,6 +38,13 @@
             "enum": ["tmaily", "gmail", "procmail", "mailtm"],
             "enumTitles": ["tmaily.com (default)", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
         },
+        "tmailyDomain": {
+            "title": "tmaily domain",
+            "type": "string",
+            "description": "Domain to mint tmaily.com addresses on (must be one of tmaily's active domains). Leave empty to let tmaily pick a random domain.",
+            "editor": "textfield",
+            "default": "imgcompress.io"
+        },
         "gmailAddress": {
             "title": "Gmail address",
             "type": "string",

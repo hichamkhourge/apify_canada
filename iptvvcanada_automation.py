@@ -55,7 +55,8 @@ EMAIL_MAX_WAIT_SECONDS = int(os.getenv("IPTVV_EMAIL_MAX_WAIT_SECONDS", "2700")) 
 # Email backend:
 #   "tmaily" (default) — tmaily.com same-origin REST API. GET /generate for an
 #                address (session cookie binds the inbox), GET /emails?address=
-#                for messages. Inboxes auto-expire after 24h.
+#                for messages. Inboxes auto-expire after 24h. Addresses are
+#                pinned to TMAILY_DOMAIN (default imgcompress.io).
 #   "gmail"           — real Gmail inbox with a unique plus-addressed alias per run
 #                (e.g. wdmonitoring+55455@gmail.com), polled over IMAP with an app
 #                password. Disposable-mail domains get dropped by IPTVV's mailer;
@@ -65,6 +66,8 @@ EMAIL_MAX_WAIT_SECONDS = int(os.getenv("IPTVV_EMAIL_MAX_WAIT_SECONDS", "2700")) 
 #   "mailtm"          — legacy mail.tm REST API (kept as a fallback).
 IPTVV_EMAIL_BACKEND = os.getenv("IPTVV_EMAIL_BACKEND", "tmaily").strip().lower()
 TMAILY_API_BASE = os.getenv("TMAILY_API_BASE", "https://tmaily.com").rstrip("/")
+# Domain to mint tmaily addresses on; set to "" to let tmaily pick a random one.
+TMAILY_DOMAIN = os.getenv("TMAILY_DOMAIN", "imgcompress.io").strip()
 PROCMAIL_API_BASE = os.getenv("PROCMAIL_API_BASE", "https://api.procmail.xyz").rstrip("/")
 IPTVV_GMAIL_ADDRESS = os.getenv("IPTVV_GMAIL_ADDRESS", "wdmonitoring@gmail.com").strip()
 IPTVV_GMAIL_APP_PASSWORD = os.getenv("IPTVV_GMAIL_APP_PASSWORD", "").strip()
@@ -472,11 +475,14 @@ def create_tmaily_inbox():
 
     Returns the email address string, or None on failure. Passes force=true so
     every call mints a fresh address instead of returning the session's
-    current one.
+    current one, and pins the address to TMAILY_DOMAIN when set.
     """
     try:
+        params = {"force": "true"}
+        if TMAILY_DOMAIN:
+            params["domain"] = TMAILY_DOMAIN
         resp = _tmaily_session().get(
-            f"{TMAILY_API_BASE}/generate", params={"force": "true"}, timeout=15
+            f"{TMAILY_API_BASE}/generate", params=params, timeout=15
         )
         resp.raise_for_status()
         data = resp.json()
@@ -485,6 +491,10 @@ def create_tmaily_inbox():
         address = (data or {}).get("address", "")
         if "@" not in address:
             raise RuntimeError(f"unexpected /generate response: {str(data)[:120]!r}")
+        if TMAILY_DOMAIN and not address.endswith("@" + TMAILY_DOMAIN):
+            raise RuntimeError(
+                f"tmaily returned {address!r}, not on requested domain {TMAILY_DOMAIN}"
+            )
         print(f"[OK] tmaily inbox created: {address}")
         return address
     except Exception as exc:
