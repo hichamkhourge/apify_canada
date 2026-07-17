@@ -7,15 +7,19 @@ and extracts Xtream credentials from the received email.
 Install deps: pip install selenium webdriver-manager 2captcha-python python-dotenv requests
 """
 import argparse
+import base64
 import html
 import imaplib
 import json
 import os
 import random
 import re
+import select
+import socket
 import string
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 import requests
@@ -871,6 +875,128 @@ def get_chrome_major_version(chrome_binary):
         return None
 
 
+# Holds the running local forwarding proxy so its listener thread isn't GC'd.
+_local_proxy = None
+
+
+class _ForwardingProxy:
+    """A local no-auth HTTP/HTTPS proxy that chains to an authenticated upstream.
+
+    Chrome's in-browser proxy auth (extension onAuthRequired) is unreliable under
+    undetected-chromedriver / the regular-driver fallback and yields empty pages.
+    Instead we run this tiny proxy on 127.0.0.1 with no auth, point Chrome at it,
+    and inject the upstream's Proxy-Authorization here. This mirrors how `requests`
+    reaches the site successfully through the same upstream proxy.
+    """
+
+    def __init__(self, upstream_url):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(upstream_url)
+        self.up_host = parsed.hostname
+        self.up_port = parsed.port
+        self.auth_header = None
+        if parsed.username:
+            cred = f"{parsed.username}:{parsed.password or ''}"
+            self.auth_header = base64.b64encode(cred.encode()).decode()
+
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(128)
+        self.port = self.server.getsockname()[1]
+
+    def start(self):
+        threading.Thread(target=self._serve, daemon=True).start()
+        return self.port
+
+    def _serve(self):
+        while True:
+            try:
+                client, _ = self.server.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+
+    def _handle(self, client):
+        upstream = None
+        try:
+            header = b""
+            while b"\r\n\r\n" not in header:
+                chunk = client.recv(4096)
+                if not chunk:
+                    client.close()
+                    return
+                header += chunk
+            head, _, rest = header.partition(b"\r\n\r\n")
+            lines = head.split(b"\r\n")
+            request_line = lines[0].decode("latin1")
+            method = request_line.split(" ", 1)[0].upper()
+
+            upstream = socket.create_connection((self.up_host, self.up_port), timeout=30)
+
+            if method == "CONNECT":
+                target = request_line.split(" ")[1]
+                req = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                if self.auth_header:
+                    req += f"Proxy-Authorization: Basic {self.auth_header}\r\n"
+                req += "\r\n"
+                upstream.sendall(req.encode())
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = upstream.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                # Relay the upstream's CONNECT status line back to the client.
+                client.sendall(resp.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n")
+                if rest:
+                    upstream.sendall(rest)
+            else:
+                # Plain HTTP: strip any client proxy-auth, inject ours, forward.
+                new_lines = [lines[0]]
+                for line in lines[1:]:
+                    if line.lower().startswith(b"proxy-authorization:"):
+                        continue
+                    new_lines.append(line)
+                if self.auth_header:
+                    new_lines.append(f"Proxy-Authorization: Basic {self.auth_header}".encode())
+                upstream.sendall(b"\r\n".join(new_lines) + b"\r\n\r\n" + rest)
+
+            self._tunnel(client, upstream)
+        except Exception:
+            for sock in (client, upstream):
+                try:
+                    if sock:
+                        sock.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _tunnel(a, b):
+        socks = [a, b]
+        try:
+            while True:
+                readable, _, errored = select.select(socks, [], socks, 120)
+                if errored or not readable:
+                    break
+                for s in readable:
+                    other = b if s is a else a
+                    try:
+                        buf = s.recv(65536)
+                    except Exception:
+                        return
+                    if not buf:
+                        return
+                    other.sendall(buf)
+        finally:
+            for s in socks:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+
 def _build_proxy_auth_extension(proxy_url):
     """Write an unpacked Chrome extension that routes traffic through proxy_url.
 
@@ -986,22 +1112,26 @@ def get_driver():
     # Route through the residential proxy when configured; otherwise force a
     # direct connection. A datacenter IP (e.g. Apify/AWS) gets IP-blocked by
     # IPTVV's Cloudflare, so IPTVV_PROXY_URL should point at a residential exit.
-    proxy_ext_dir = None
+    global _local_proxy
+    local_proxy_port = None
     if IPTVV_PROXY_URL:
-        proxy_ext_dir = _build_proxy_auth_extension(IPTVV_PROXY_URL)
-    if proxy_ext_dir:
-        from urllib.parse import urlparse
-        parsed = urlparse(IPTVV_PROXY_URL)
-        proxy_scheme = "https" if parsed.scheme in ("https", "socks5") else "http"
-        # Set the proxy on the command line too (not just via the extension's
-        # chrome.proxy API): this forces routing immediately, while the extension
-        # supplies the credentials for the proxy's auth challenge.
-        options.add_argument(f"--proxy-server={proxy_scheme}://{parsed.hostname}:{parsed.port}")
-        options.add_argument(f"--load-extension={proxy_ext_dir}")
-        print("[*] Routing browser through residential proxy (--proxy-server + auth extension)")
+        try:
+            _local_proxy = _ForwardingProxy(IPTVV_PROXY_URL)
+            local_proxy_port = _local_proxy.start()
+        except Exception as exc:
+            print(f"[!] Failed to start local forwarding proxy: {exc}")
+            local_proxy_port = None
+    if local_proxy_port:
+        # Chrome talks to a no-auth localhost proxy; the forwarder injects the
+        # upstream residential proxy's credentials. This avoids the unreliable
+        # in-browser auth extension that returns empty pages under uc.
+        options.add_argument(f"--proxy-server=http://127.0.0.1:{local_proxy_port}")
+        options.add_argument("--proxy-bypass-list=<-loopback>")
+        print(f"[*] Routing browser through local forwarding proxy 127.0.0.1:{local_proxy_port} "
+              "-> upstream residential proxy")
     else:
         if IPTVV_PROXY_URL:
-            print("[!] Proxy requested but extension build failed; falling back to direct connection")
+            print("[!] Proxy requested but forwarder unavailable; falling back to direct connection")
         # Explicitly disable any proxy to prevent ERR_NO_SUPPORTED_PROXIES from a
         # leaked system/env proxy setting.
         options.add_argument("--no-proxy-server")
