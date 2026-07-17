@@ -1414,9 +1414,16 @@ def wait_for_real_checkout_page(driver, context, timeout=30):
         )
 
     artifacts = save_page_debug_artifacts(driver, "checkout_not_loaded")
+    page_text = page_text_lower(driver)
+    empty_cart_markers = (
+        "your cart is currently empty",
+        "your cart is empty",
+        "no products in the cart",
+        "cart is currently empty",
+    )
     empty_cart_hint = (
         " (page shows an empty cart - the trial product was never added)"
-        if "your cart is currently empty" in page_text_lower(driver)
+        if any(marker in page_text for marker in empty_cart_markers)
         else ""
     )
     raise RuntimeError(

@@ -123,11 +123,38 @@ async def main():
             )
 
 
+async def _upload_debug_artifacts():
+    """Push the newest screenshot/HTML snapshot to the KV store for inspection.
+
+    The automation writes debug artifacts to IPTVV_DEBUG_DIR on the container's
+    ephemeral disk; copy the latest of each to the run's key-value store so they
+    can be downloaded from the Apify Console after a failure.
+    """
+    import glob
+
+    debug_dir = os.environ.get("IPTVV_DEBUG_DIR", "/tmp/iptvv-logs")
+    for ext, key, content_type in (
+        ("html", "DEBUG_PAGE", "text/html"),
+        ("png", "DEBUG_SCREENSHOT", "image/png"),
+    ):
+        try:
+            matches = glob.glob(os.path.join(debug_dir, f"*.{ext}"))
+            if not matches:
+                continue
+            newest = max(matches, key=os.path.getmtime)
+            with open(newest, "rb") as fh:
+                await Actor.set_value(key, fh.read(), content_type=content_type)
+            Actor.log.info(f"Uploaded {os.path.basename(newest)} to KV store as {key}")
+        except Exception as exc:  # noqa: BLE001 - diagnostics are best-effort
+            Actor.log.warning(f"Could not upload {ext} debug artifact: {exc}")
+
+
 async def _report_failure(bot, callback_url, user_id, exc):
     """Persist the failure to the dataset/KV store and fire the webhook."""
     output = {"status": "failed", "error": str(exc)}
     await Actor.push_data(output)
     await Actor.set_value("OUTPUT", output)
+    await _upload_debug_artifacts()
     if callback_url:
         await asyncio.to_thread(
             bot.send_webhook_callback,
