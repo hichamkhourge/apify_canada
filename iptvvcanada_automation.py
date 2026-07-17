@@ -1379,14 +1379,25 @@ def wait_for_real_checkout_page(driver, context, timeout=30):
     if cloudflare_seen or is_cloudflare_block_page(driver):
         artifacts = save_page_debug_artifacts(driver, "cloudflare_block")
         diagnostics = extract_cloudflare_diagnostics(driver)
+        # Container egress (requests, NOT proxied) vs browser egress (goes through
+        # IPTVV_PROXY_URL when set). Compare the two: if the browser IP still equals
+        # the container's AWS IP, the residential proxy is not being applied.
         public_ip = get_public_ip()
+        browser_ip = get_browser_public_ip(driver)
         print(f"[!] Cloudflare Ray ID: {diagnostics['ray_id']}")
         print(f"[!] Cloudflare reason: {diagnostics['reason']}")
-        print(f"[!] Production public IP: {public_ip}")
+        print(f"[!] Container public IP (unproxied): {public_ip}")
+        print(f"[!] Browser-visible public IP (proxied egress): {browser_ip}")
+        if IPTVV_PROXY_URL and browser_ip not in ("unknown", "") and browser_ip == public_ip:
+            print("[!] Browser IP equals container IP despite IPTVV_PROXY_URL being set "
+                  "-> residential proxy is NOT taking effect.")
+        elif not IPTVV_PROXY_URL:
+            print("[!] No IPTVV_PROXY_URL set -> browser is on the datacenter IP (no proxy).")
         raise CloudflareBlockedError(
             "IPTVV checkout is blocked by Cloudflare/WAF in this production container. "
             "The checkout form never loaded. "
-            f"Public IP: {public_ip}; Cloudflare Ray ID: {diagnostics['ray_id']}; "
+            f"Container IP: {public_ip}; browser IP: {browser_ip}; "
+            f"Cloudflare Ray ID: {diagnostics['ray_id']}; "
             f"debug HTML: {artifacts.get('html', 'not saved')}; "
             f"screenshot: {artifacts.get('screenshot', 'not saved')}. "
             "Ask IPTVV/Cloudflare to allowlist this server or provide an approved API/integration path."
