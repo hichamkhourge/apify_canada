@@ -41,8 +41,11 @@ def _apply_input_to_env(actor_input):
     if actor_input.get("iboPlayerEnabled"):
         os.environ["IPTVV_IBOPLAYER_ENABLED"] = "True"
 
-    # Apify always runs headless and should never hang waiting for a browser.
-    os.environ["HEADLESS"] = "True"
+    # Apify runs Chrome headed under an Xvfb virtual display (see the actor's
+    # `xvfb-run ...` launch command). Headed mode loads the proxy-auth extension
+    # reliably (new-headless does not) and is less bot-detectable, so we do NOT
+    # force headless here.
+    os.environ.setdefault("HEADLESS", "False")
     os.environ["AUTO_EXIT"] = "True"
     # Apify containers can't write to /app; use a writable scratch dir for artifacts.
     os.environ.setdefault("IPTVV_DEBUG_DIR", "/tmp/iptvv-logs")

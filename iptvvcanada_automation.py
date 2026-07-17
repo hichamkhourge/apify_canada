@@ -905,7 +905,7 @@ def _build_proxy_auth_extension(proxy_url):
             "proxy", "tabs", "unlimitedStorage", "storage",
             "<all_urls>", "webRequest", "webRequestBlocking",
         ],
-        "background": {"scripts": ["background.js"]},
+        "background": {"scripts": ["background.js"], "persistent": True},
         "minimum_chrome_version": "22.0.0",
     }
     background_js = """
@@ -943,21 +943,24 @@ def get_driver():
     Routes browser egress through IPTVV_PROXY_URL when set (residential proxy),
     otherwise uses a direct connection on the host's public IP.
     """
-    headless_mode = os.getenv("HEADLESS", "True").lower() == "true"
+    headless_mode = os.getenv("HEADLESS", "False").lower() == "true"
 
     # Use undetected-chromedriver's ChromeOptions
     options = uc.ChromeOptions()
 
+    # Container-stability flags are needed whether headless or headed (under Xvfb).
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+
     if headless_mode:
+        # new-headless Chrome does not reliably run extension background scripts,
+        # which breaks the proxy-auth extension. Prefer headed mode under Xvfb.
         options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--window-size=1920,1080")
         print("[*] Running in HEADLESS mode")
     else:
-        options.add_argument("--start-maximized")
-        print("[*] Running in GUI mode")
+        print("[*] Running in headed mode (virtual display / Xvfb)")
 
     # Use random user agent for additional anonymity
     random_ua = get_random_user_agent()
@@ -987,8 +990,15 @@ def get_driver():
     if IPTVV_PROXY_URL:
         proxy_ext_dir = _build_proxy_auth_extension(IPTVV_PROXY_URL)
     if proxy_ext_dir:
+        from urllib.parse import urlparse
+        parsed = urlparse(IPTVV_PROXY_URL)
+        proxy_scheme = "https" if parsed.scheme in ("https", "socks5") else "http"
+        # Set the proxy on the command line too (not just via the extension's
+        # chrome.proxy API): this forces routing immediately, while the extension
+        # supplies the credentials for the proxy's auth challenge.
+        options.add_argument(f"--proxy-server={proxy_scheme}://{parsed.hostname}:{parsed.port}")
         options.add_argument(f"--load-extension={proxy_ext_dir}")
-        print("[*] Routing browser through residential proxy (via auth extension)")
+        print("[*] Routing browser through residential proxy (--proxy-server + auth extension)")
     else:
         if IPTVV_PROXY_URL:
             print("[!] Proxy requested but extension build failed; falling back to direct connection")
