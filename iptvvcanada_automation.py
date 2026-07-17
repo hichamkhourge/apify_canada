@@ -15,6 +15,7 @@ import random
 import re
 import string
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 import requests
@@ -78,6 +79,11 @@ IPTVV_TRIAL_PRODUCT_ID = os.getenv("IPTVV_TRIAL_PRODUCT_ID", "7758")
 IPTVV_CLOUDFLARE_WAIT_SECONDS = int(os.getenv("IPTVV_CLOUDFLARE_WAIT_SECONDS", "45"))
 IPTVV_DEBUG_DIR = os.getenv("IPTVV_DEBUG_DIR", "/app/logs")
 IPTVV_PROXY_CHECK_URL = os.getenv("IPTVV_PROXY_CHECK_URL", "https://api.ipify.org")
+# Optional upstream HTTP proxy for the browser, as a full URL:
+#   http://user:pass@host:port  (credentials optional).
+# On Apify this is populated from Actor.create_proxy_configuration().new_url()
+# so browser egress uses a residential IP instead of the blocked datacenter IP.
+IPTVV_PROXY_URL = os.getenv("IPTVV_PROXY_URL", "").strip()
 IPTVV_KNOWN_BLOCKED_IP = os.getenv("IPTVV_KNOWN_BLOCKED_IP", "").strip()
 
 # IBO Player integration configuration
@@ -865,10 +871,77 @@ def get_chrome_major_version(chrome_binary):
         return None
 
 
+def _build_proxy_auth_extension(proxy_url):
+    """Write an unpacked Chrome extension that routes traffic through proxy_url.
+
+    Chrome's --proxy-server flag can't carry credentials, so for an authenticated
+    proxy we ship a tiny extension that (1) sets fixed_servers to the proxy host
+    and (2) answers the proxy's auth challenge with the embedded username/password.
+
+    Args:
+        proxy_url: full proxy URL, e.g. "http://user:pass@host:8000".
+
+    Returns:
+        Path to a temp directory holding manifest.json + background.js, or None
+        if the URL can't be parsed.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(proxy_url)
+    host, port = parsed.hostname, parsed.port
+    if not host or not port:
+        print(f"[!] Invalid IPTVV_PROXY_URL (need host:port): {proxy_url!r}")
+        return None
+    scheme = "https" if parsed.scheme in ("https", "socks5") else "http"
+    user = parsed.username or ""
+    password = parsed.password or ""
+
+    ext_dir = tempfile.mkdtemp(prefix="proxy_auth_ext_")
+    manifest = {
+        "name": "Proxy Auth",
+        "version": "1.0.0",
+        "manifest_version": 2,
+        "permissions": [
+            "proxy", "tabs", "unlimitedStorage", "storage",
+            "<all_urls>", "webRequest", "webRequestBlocking",
+        ],
+        "background": {"scripts": ["background.js"]},
+        "minimum_chrome_version": "22.0.0",
+    }
+    background_js = """
+var config = {
+    mode: "fixed_servers",
+    rules: {
+        singleProxy: { scheme: "%(scheme)s", host: "%(host)s", port: parseInt(%(port)s) },
+        bypassList: ["localhost"]
+    }
+};
+chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+function callbackFn(details) {
+    return { authCredentials: { username: "%(user)s", password: "%(password)s" } };
+}
+chrome.webRequest.onAuthRequired.addListener(
+    callbackFn,
+    { urls: ["<all_urls>"] },
+    ["blocking"]
+);
+""" % {"scheme": scheme, "host": host, "port": port, "user": user, "password": password}
+
+    with open(os.path.join(ext_dir, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh)
+    with open(os.path.join(ext_dir, "background.js"), "w") as fh:
+        fh.write(background_js)
+
+    safe_host = f"{host}:{port}"
+    print(f"[*] Proxy auth extension built for {scheme}://{safe_host} (auth: {'yes' if user else 'no'})")
+    return ext_dir
+
+
 def get_driver():
     """Initialize Chrome WebDriver with anti-detection options (undetected-chromedriver).
 
-    Always uses a direct connection on the host's public IP; no proxy.
+    Routes browser egress through IPTVV_PROXY_URL when set (residential proxy),
+    otherwise uses a direct connection on the host's public IP.
     """
     headless_mode = os.getenv("HEADLESS", "True").lower() == "true"
 
@@ -907,15 +980,27 @@ def get_driver():
         "profile.managed_default_content_settings.images": 1,  # Enable images
     }
 
-    # Always use a direct connection (no proxy). Explicitly disable any proxy
-    # to prevent ERR_NO_SUPPORTED_PROXIES from a leaked system/env proxy setting.
-    options.add_argument("--no-proxy-server")
-    prefs["proxy"] = {
-        "mode": "direct",
-        "pac_url": "",
-        "bypass_list": ""
-    }
-    print("[*] Using direct connection (public IP, no proxy)")
+    # Route through the residential proxy when configured; otherwise force a
+    # direct connection. A datacenter IP (e.g. Apify/AWS) gets IP-blocked by
+    # IPTVV's Cloudflare, so IPTVV_PROXY_URL should point at a residential exit.
+    proxy_ext_dir = None
+    if IPTVV_PROXY_URL:
+        proxy_ext_dir = _build_proxy_auth_extension(IPTVV_PROXY_URL)
+    if proxy_ext_dir:
+        options.add_argument(f"--load-extension={proxy_ext_dir}")
+        print("[*] Routing browser through residential proxy (via auth extension)")
+    else:
+        if IPTVV_PROXY_URL:
+            print("[!] Proxy requested but extension build failed; falling back to direct connection")
+        # Explicitly disable any proxy to prevent ERR_NO_SUPPORTED_PROXIES from a
+        # leaked system/env proxy setting.
+        options.add_argument("--no-proxy-server")
+        prefs["proxy"] = {
+            "mode": "direct",
+            "pac_url": "",
+            "bypass_list": ""
+        }
+        print("[*] Using direct connection (public IP, no proxy)")
 
     options.add_experimental_option("prefs", prefs)
 

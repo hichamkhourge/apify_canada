@@ -29,6 +29,27 @@
             "editor": "textfield",
             "isSecret": true
         },
+        "useApifyProxy": {
+            "title": "Use Apify residential proxy",
+            "type": "boolean",
+            "description": "Route the browser through Apify's residential proxy so IPTVV's Cloudflare sees a residential IP instead of the datacenter IP (which it blocks). Disable only to use a direct connection.",
+            "editor": "checkbox",
+            "default": true
+        },
+        "proxyCountry": {
+            "title": "Proxy country code",
+            "type": "string",
+            "description": "ISO country code for the residential exit IP (the target site is iptvv.ca, so CA is the default). Leave empty for any country.",
+            "editor": "textfield",
+            "default": "CA"
+        },
+        "proxyGroups": {
+            "title": "Proxy groups",
+            "type": "string",
+            "description": "Comma-separated Apify proxy groups. RESIDENTIAL is required to pass Cloudflare's datacenter-IP block.",
+            "editor": "textfield",
+            "default": "RESIDENTIAL"
+        },
         "emailBackend": {
             "title": "Email backend",
             "type": "string",

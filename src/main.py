@@ -48,10 +48,40 @@ def _apply_input_to_env(actor_input):
     os.environ.setdefault("IPTVV_DEBUG_DIR", "/tmp/iptvv-logs")
 
 
+async def _apply_proxy_to_env(actor_input):
+    """Resolve an Apify residential proxy URL and expose it as IPTVV_PROXY_URL.
+
+    IPTVV's Cloudflare IP-blocks datacenter IPs, so browser egress must go
+    through a residential exit. Defaults to the RESIDENTIAL group in Canada
+    (the target site is iptvv.ca); both are overridable via input.
+    """
+    if not actor_input.get("useApifyProxy", True):
+        Actor.log.info("Apify proxy disabled by input; browser will use a direct connection")
+        return
+
+    groups_raw = actor_input.get("proxyGroups") or "RESIDENTIAL"
+    groups = [g.strip() for g in str(groups_raw).split(",") if g.strip()]
+    country = (actor_input.get("proxyCountry") or "CA").strip() or None
+
+    try:
+        proxy_cfg = await Actor.create_proxy_configuration(
+            groups=groups, country_code=country
+        )
+        if proxy_cfg is None:
+            Actor.log.warning("No Apify proxy available on this account; using direct connection")
+            return
+        proxy_url = await proxy_cfg.new_url()
+        os.environ["IPTVV_PROXY_URL"] = proxy_url
+        Actor.log.info(f"Browser will egress via Apify proxy (groups={groups}, country={country})")
+    except Exception as exc:  # noqa: BLE001 - proxy is best-effort; fall back to direct
+        Actor.log.warning(f"Failed to set up Apify proxy ({exc}); using direct connection")
+
+
 async def main():
     async with Actor:
         actor_input = await Actor.get_input() or {}
         _apply_input_to_env(actor_input)
+        await _apply_proxy_to_env(actor_input)
 
         user_id = actor_input.get("userId")
         callback_url = actor_input.get("callbackUrl")
