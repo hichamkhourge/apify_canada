@@ -1156,6 +1156,65 @@ def is_browser_error_page(driver):
     return current_url.startswith("chrome-error://") or any(marker in body for marker in markers)
 
 
+def log_page_diagnostics(driver, label):
+    """Print inline page diagnostics so the failure is visible in the run log.
+
+    Dumps URL, title, body-text length + preview, HTML length + head snippet, and
+    classifies common blank-page causes (proxy 407, Cloudflare JS challenge,
+    Chrome error page, empty document). Avoids needing the saved artifacts.
+    """
+    print(f"[diag] ===== page diagnostics ({label}) =====")
+    try:
+        print(f"[diag] current_url: {driver.current_url}")
+        print(f"[diag] title: {driver.title!r}")
+    except Exception as exc:
+        print(f"[diag] could not read url/title: {exc}")
+
+    body_text = ""
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
+    except Exception as exc:
+        print(f"[diag] could not read body text: {exc}")
+    print(f"[diag] body text length: {len(body_text)}")
+    if body_text:
+        preview = re.sub(r"\s+", " ", body_text)[:500]
+        print(f"[diag] body text preview: {preview}")
+
+    html = ""
+    try:
+        html = driver.page_source or ""
+    except Exception as exc:
+        print(f"[diag] could not read page_source: {exc}")
+    print(f"[diag] page_source length: {len(html)}")
+    if html:
+        snippet = re.sub(r"\s+", " ", html)[:1200]
+        print(f"[diag] page_source head: {snippet}")
+
+    lowered = (body_text + " " + html).lower()
+    classifications = []
+    if any(m in lowered for m in ("proxy authentication required", "407", "err_tunnel_connection_failed",
+                                   "err_proxy_connection_failed", "err_no_supported_proxies")):
+        classifications.append("PROXY AUTH / TUNNEL FAILURE (407) - the auth extension is not supplying credentials")
+    if any(m in lowered for m in ("just a moment", "checking your browser", "cf-challenge", "challenge-platform")):
+        classifications.append("CLOUDFLARE JS CHALLENGE (interstitial, not a hard block)")
+    if any(m in lowered for m in ("your cart is currently empty", "your cart is empty", "no products in the cart")):
+        classifications.append("EMPTY CART (trial product was never added)")
+    if driver_current_url_is_error(driver):
+        classifications.append("CHROME ERROR PAGE (never reached the site)")
+    if len(html) < 200 and len(body_text) < 5:
+        classifications.append("ESSENTIALLY EMPTY DOCUMENT (blank response)")
+    print(f"[diag] classification: {', '.join(classifications) if classifications else 'unknown - inspect DEBUG_PAGE'}")
+    print("[diag] ===================================")
+
+
+def driver_current_url_is_error(driver):
+    """True if Chrome is showing its own error page (chrome-error://)."""
+    try:
+        return (driver.current_url or "").lower().startswith("chrome-error://")
+    except Exception:
+        return False
+
+
 def save_page_debug_artifacts(driver, label):
     """Save a screenshot and HTML snapshot for production diagnosis."""
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1414,6 +1473,7 @@ def wait_for_real_checkout_page(driver, context, timeout=30):
         )
 
     artifacts = save_page_debug_artifacts(driver, "checkout_not_loaded")
+    log_page_diagnostics(driver, "checkout_not_loaded")
     page_text = page_text_lower(driver)
     empty_cart_markers = (
         "your cart is currently empty",
@@ -1536,6 +1596,9 @@ def navigate_to_cart_and_get_free_trial(driver):
         print(f"[*] After click URL: {driver.current_url}")
     except TimeoutError:
         print("[!] Add-to-cart trial button not found")
+        # First page of the flow: dump diagnostics so we can tell whether the
+        # cart page itself came back blank (proxy issue) or just lacks the button.
+        log_page_diagnostics(driver, "cart_button_not_found")
 
     if not cart_has_items(driver):
         print("[*] Cart is still empty; trying direct add-to-cart URL...")
