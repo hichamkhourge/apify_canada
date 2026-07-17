@@ -25,7 +25,10 @@ RUN echo "Python version:" \
 COPY . ./
 
 # undetected-chromedriver downloads a matching driver at runtime into HOME.
-ENV HEADLESS=True \
+# HEADLESS is intentionally False: the actor runs Chrome headed under an Xvfb
+# virtual display (see the actor's xvfb-run launch command), which loads the
+# proxy-auth extension reliably and is less bot-detectable than new-headless.
+ENV HEADLESS=False \
     AUTO_EXIT=True \
     IPTVV_DEBUG_DIR=/tmp/iptvv-logs
 
