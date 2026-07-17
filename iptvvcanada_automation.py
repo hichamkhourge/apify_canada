@@ -1204,7 +1204,49 @@ def log_page_diagnostics(driver, label):
     if len(html) < 200 and len(body_text) < 5:
         classifications.append("ESSENTIALLY EMPTY DOCUMENT (blank response)")
     print(f"[diag] classification: {', '.join(classifications) if classifications else 'unknown - inspect DEBUG_PAGE'}")
+
+    # When the browser shows an empty document, hit the same URL through the same
+    # proxy with requests to reveal the raw HTTP status/headers the browser hides.
+    # This distinguishes a silent Cloudflare/site block (403/503/empty 200) from a
+    # proxy problem, and shows whether the residential exit reaches the origin.
+    if IPTVV_PROXY_URL and len(html) < 200:
+        probe_url = driver.current_url if (driver.current_url or "").startswith("http") else IPTVV_BASE_URL
+        _proxy_probe(probe_url)
     print("[diag] ===================================")
+
+
+def _proxy_probe(url):
+    """GET url through IPTVV_PROXY_URL with requests and log the raw response."""
+    try:
+        import urllib3
+        urllib3.disable_warnings()
+    except Exception:
+        pass
+    try:
+        resp = requests.get(
+            url,
+            proxies={"http": IPTVV_PROXY_URL, "https": IPTVV_PROXY_URL},
+            headers={"User-Agent": get_random_user_agent()},
+            timeout=30,
+            verify=False,
+            allow_redirects=True,
+        )
+        body = re.sub(r"\s+", " ", resp.text or "")[:800]
+        print(f"[diag] proxy probe {url} -> HTTP {resp.status_code} {resp.reason}, {len(resp.content)} bytes")
+        print(f"[diag] proxy probe headers: server={resp.headers.get('Server')!r} "
+              f"cf-ray={resp.headers.get('CF-Ray')!r} cf-mitigated={resp.headers.get('cf-mitigated')!r} "
+              f"content-type={resp.headers.get('Content-Type')!r}")
+        print(f"[diag] proxy probe body head: {body}")
+    except Exception as exc:
+        print(f"[diag] proxy probe failed: {type(exc).__name__}: {exc}")
+
+
+def driver_current_url_is_error(driver):
+    """True if Chrome is showing its own error page (chrome-error://)."""
+    try:
+        return (driver.current_url or "").lower().startswith("chrome-error://")
+    except Exception:
+        return False
 
 
 def driver_current_url_is_error(driver):
