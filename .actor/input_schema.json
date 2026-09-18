@@ -53,11 +53,24 @@
         "emailBackend": {
             "title": "Email backend",
             "type": "string",
-            "description": "Which mailbox to use for receiving the credentials email. 'tmaily' allocates a disposable tmaily.com inbox per run; 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
+            "description": "Which mailbox to use for receiving the credentials email. 'mailcx' uses api.mail.cx (requires an API token below); 'tmaily' allocates a disposable tmaily.com inbox per run; 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
             "editor": "select",
-            "default": "tmaily",
-            "enum": ["tmaily", "gmail", "procmail", "mailtm"],
-            "enumTitles": ["tmaily.com (default)", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
+            "default": "mailcx",
+            "enum": ["mailcx", "tmaily", "gmail", "procmail", "mailtm"],
+            "enumTitles": ["mail.cx (default)", "tmaily.com", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
+        },
+        "mailcxApiToken": {
+            "title": "mail.cx API token",
+            "type": "string",
+            "description": "API token for api.mail.cx (mail.cx dashboard -> Tokens). Required for the 'mailcx' backend.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "mailcxDomain": {
+            "title": "mail.cx domain",
+            "type": "string",
+            "description": "Domain to mint mail.cx addresses on (must be one of mail.cx's system domains). Leave empty to use mail.cx's default domain.",
+            "editor": "textfield"
         },
         "tmailyDomain": {
             "title": "tmaily domain",

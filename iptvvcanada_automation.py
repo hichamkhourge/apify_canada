@@ -58,10 +58,17 @@ EMAIL_POLL_SECONDS = int(os.getenv("IPTVV_EMAIL_POLL_SECONDS", "30"))
 EMAIL_MAX_WAIT_SECONDS = int(os.getenv("IPTVV_EMAIL_MAX_WAIT_SECONDS", "2700"))  # 45 minutes
 
 # Email backend:
-#   "tmaily" (default) — tmaily.com same-origin REST API. GET /generate for an
+#   "mailcx" (default) — api.mail.cx v1 REST API. The mailbox itself is implicit
+#                (any local-part @ a system domain is live immediately, no
+#                signup), but reading it needs an account API token
+#                (MAILCX_API_TOKEN, from the mail.cx dashboard -> Tokens).
+#                GET /v1/inbox/<address> long-polls server-side for up to 25s
+#                per call, so no client-side poll loop is needed.
+#   "tmaily"          — tmaily.com same-origin REST API. GET /generate for an
 #                address (session cookie binds the inbox), GET /emails?address=
 #                for messages. Inboxes auto-expire after 24h. Addresses are
-#                pinned to TMAILY_DOMAIN (default imgcompress.io).
+#                pinned to TMAILY_DOMAIN (default imgcompress.io) when that
+#                domain is still live; tmaily rotates its domain roster.
 #   "gmail"           — real Gmail inbox with a unique plus-addressed alias per run
 #                (e.g. wdmonitoring+55455@gmail.com), polled over IMAP with an app
 #                password. Disposable-mail domains get dropped by IPTVV's mailer;
@@ -69,11 +76,15 @@ EMAIL_MAX_WAIT_SECONDS = int(os.getenv("IPTVV_EMAIL_MAX_WAIT_SECONDS", "2700")) 
 #   "procmail"        — api.procmail.xyz REST API (powers 8gwifi.org/temp-email.jsp).
 #                Pure HTTP: GET /generate for an address, GET /inbox/{addr} for messages.
 #   "mailtm"          — legacy mail.tm REST API (kept as a fallback).
-IPTVV_EMAIL_BACKEND = os.getenv("IPTVV_EMAIL_BACKEND", "tmaily").strip().lower()
+IPTVV_EMAIL_BACKEND = os.getenv("IPTVV_EMAIL_BACKEND", "mailcx").strip().lower()
 TMAILY_API_BASE = os.getenv("TMAILY_API_BASE", "https://tmaily.com").rstrip("/")
 # Domain to mint tmaily addresses on; set to "" to let tmaily pick a random one.
 TMAILY_DOMAIN = os.getenv("TMAILY_DOMAIN", "imgcompress.io").strip()
 PROCMAIL_API_BASE = os.getenv("PROCMAIL_API_BASE", "https://api.procmail.xyz").rstrip("/")
+MAILCX_API_BASE = os.getenv("MAILCX_API_BASE", "https://api.mail.cx/v1").rstrip("/")
+MAILCX_API_TOKEN = os.getenv("MAILCX_API_TOKEN", "").strip()
+# Domain to mint mailcx addresses on; leave "" to use whatever /v1/config marks default.
+MAILCX_DOMAIN = os.getenv("MAILCX_DOMAIN", "").strip()
 IPTVV_GMAIL_ADDRESS = os.getenv("IPTVV_GMAIL_ADDRESS", "wdmonitoring@gmail.com").strip()
 IPTVV_GMAIL_APP_PASSWORD = os.getenv("IPTVV_GMAIL_APP_PASSWORD", "").strip()
 IPTVV_GMAIL_IMAP_HOST = os.getenv("IPTVV_GMAIL_IMAP_HOST", "imap.gmail.com")
@@ -669,6 +680,226 @@ def _wait_for_credentials_email_tmaily(address, max_wait_seconds=EMAIL_MAX_WAIT_
 
 
 # ═══════════════════════════════════════════════════════════
+# mail.cx email backend — api.mail.cx v1 REST API
+#
+# Mailboxes are implicit: any local-part @ a system domain is live the
+# instant a mail lands, nothing to "create". Reading it requires an account
+# API token (MAILCX_API_TOKEN, minted from the mail.cx dashboard -> Tokens);
+# anonymous requests get 401 authentication_required.
+#   GET /v1/config                   -> {"system_domains": [...], ...} (public)
+#   GET /v1/inbox/{address}          -> long-polls up to 25s server-side;
+#                                       200 with new mail, or 204 if none
+#                                       arrived in that window (just reconnect).
+#   GET /v1/email/{id}               -> full parsed body (text/html).
+# ═══════════════════════════════════════════════════════════
+_mailcx_http = None
+_mailcx_domain_cache = None
+
+
+def _mailcx_session():
+    """Lazily create the shared requests.Session carrying the API token."""
+    global _mailcx_http
+    if _mailcx_http is None:
+        _mailcx_http = requests.Session()
+        _mailcx_http.headers.update({"x-api-token": MAILCX_API_TOKEN})
+        if IPTVV_PROXY_URL:
+            # api.mail.cx is Cloudflare-fronted like tmaily.com and iptvv.ca;
+            # route through the residential proxy so it doesn't see the
+            # (likely blocked) Apify datacenter IP.
+            _mailcx_http.proxies = {"http": IPTVV_PROXY_URL, "https": IPTVV_PROXY_URL}
+            _mailcx_http.verify = False
+            try:
+                import urllib3
+                urllib3.disable_warnings()
+            except Exception:
+                pass
+    return _mailcx_http
+
+
+def _mailcx_pick_domain():
+    """Return the domain to mint addresses on, validating MAILCX_DOMAIN live.
+
+    Caches the result for the process lifetime (one run == one inbox).
+    """
+    global _mailcx_domain_cache
+    if _mailcx_domain_cache:
+        return _mailcx_domain_cache
+
+    domain = MAILCX_DOMAIN
+    try:
+        resp = _mailcx_session().get(f"{MAILCX_API_BASE}/config", timeout=15)
+        resp.raise_for_status()
+        domains = (resp.json() or {}).get("system_domains", [])
+        names = [d.get("domain") for d in domains if d.get("domain")]
+        if domain and domain not in names:
+            print(f"[!] MAILCX_DOMAIN {domain!r} is not in mail.cx's system domains "
+                  f"{names}; falling back to the default one")
+            domain = ""
+        if not domain:
+            default = next((d["domain"] for d in domains if d.get("default")), None)
+            domain = default or (names[0] if names else "")
+    except Exception as exc:
+        print(f"[!] Could not fetch mail.cx domain list: {exc}")
+
+    _mailcx_domain_cache = domain or MAILCX_DOMAIN or "uqu.me"
+    return _mailcx_domain_cache
+
+
+def verify_mailcx_token():
+    """Raise early with a clear error if MAILCX_API_TOKEN is missing/invalid.
+
+    GET /v1/tokens is a plain (non-long-poll) authenticated call, so this
+    returns immediately instead of waiting out a 25s long-poll hold.
+    """
+    if not MAILCX_API_TOKEN:
+        raise RuntimeError(
+            "MAILCX_API_TOKEN is not set; the mailcx backend needs an API token "
+            "from the mail.cx dashboard (Dashboard -> Tokens)"
+        )
+    try:
+        resp = _mailcx_session().get(f"{MAILCX_API_BASE}/tokens", timeout=15)
+        resp.raise_for_status()
+        print("[OK] mail.cx API token verified")
+    except Exception as exc:
+        raise RuntimeError(f"mail.cx API token check failed: {exc}") from exc
+
+
+def create_mailcx_inbox():
+    """Mint a disposable address on mail.cx.
+
+    Nothing is actually created server-side (mail.cx mailboxes are implicit) —
+    this just picks a live system domain and a random local-part. Returns the
+    address, or None if MAILCX_API_TOKEN is missing or the domain lookup fails.
+    """
+    try:
+        if not MAILCX_API_TOKEN:
+            raise RuntimeError(
+                "MAILCX_API_TOKEN is not set; the mailcx backend needs an API "
+                "token from the mail.cx dashboard (Dashboard -> Tokens)"
+            )
+        domain = _mailcx_pick_domain()
+        if not domain:
+            raise RuntimeError("could not determine a mail.cx domain to use")
+        local_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=14))
+        address = f"{local_part}@{domain}"
+        print(f"[OK] mailcx inbox ready: {address}")
+        return address
+    except Exception as exc:
+        print(f"[!] Failed to create mailcx inbox: {exc}")
+        return None
+
+
+def _mailcx_normalize_message(item):
+    """Map a raw mail.cx message dict onto the shared normalized shape."""
+    from email.utils import parseaddr
+
+    raw_from = item.get("from_email", item.get("from", ""))
+    if isinstance(raw_from, dict):
+        from_addr = raw_from.get("address", "") or raw_from.get("email", "")
+    else:
+        from_addr = parseaddr(str(raw_from))[1] or str(raw_from)
+
+    # "preview_text" (list endpoint) is deliberately excluded here: it's a
+    # truncated preview, and if it landed in "text" it would make
+    # _mailcx_fetch_full's already-have-a-body short-circuit skip fetching
+    # the real, complete body from GET /v1/email/<id>.
+    text_body = ""
+    html_body = ""
+    for key in ("text", "textBody", "text_body", "plainText"):
+        if item.get(key):
+            text_body = _decode_qp(str(item[key]))
+            break
+    for key in ("html", "htmlBody", "html_body", "body", "content"):
+        if item.get(key):
+            value = item[key]
+            if isinstance(value, list):
+                value = " ".join(str(v) for v in value)
+            html_body = _decode_qp(str(value))
+            break
+
+    return {
+        "id": str(item.get("id", "")),
+        "subject": _decode_mime_header(item.get("subject", "")),
+        "from": {"address": from_addr},
+        "text": text_body,
+        "html": [html_body] if html_body else [],
+    }
+
+
+def get_mailcx_messages(address, since=None):
+    """Long-poll the mail.cx inbox once; returns (messages, next_since).
+
+    The request itself blocks server-side for up to ~25s. Uses a generous
+    client timeout so that hold isn't mistaken for a network failure.
+    """
+    try:
+        params = {"since": since} if since else {}
+        resp = _mailcx_session().get(
+            f"{MAILCX_API_BASE}/inbox/{requests.utils.quote(address)}",
+            params=params,
+            timeout=35,
+        )
+        if resp.status_code == 204:
+            return [], since
+        resp.raise_for_status()
+        data = resp.json() or {}
+    except Exception as exc:
+        print(f"[!] Failed to fetch mailcx inbox: {exc}")
+        return [], since
+    emails = data.get("emails", []) if isinstance(data, dict) else []
+    next_since = data.get("next_since", since) if isinstance(data, dict) else since
+    return [_mailcx_normalize_message(item) for item in emails], next_since
+
+
+def _mailcx_fetch_full(msg):
+    """Fetch the full parsed body for a message by id."""
+    if msg.get("text") or msg.get("html"):
+        return msg
+    msg_id = msg.get("id", "")
+    try:
+        resp = _mailcx_session().get(f"{MAILCX_API_BASE}/email/{msg_id}", timeout=15)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        full = _mailcx_normalize_message(data)
+        full["subject"] = full["subject"] or msg.get("subject", "")
+        full["from"] = full["from"] if full["from"]["address"] else msg.get("from", {})
+        return full
+    except Exception as exc:
+        print(f"[!] Failed to fetch mailcx message {msg_id}: {exc}")
+        return msg
+
+
+def _wait_for_credentials_email_mailcx(address, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
+    """Long-poll the mail.cx inbox until the credentials email arrives.
+
+    Each call already blocks server-side for up to ~25s, so no extra sleep is
+    needed between iterations on a plain empty result.
+    """
+    print(f"[*] Waiting for credentials email (max {max_wait_seconds}s / {max_wait_seconds//60} minutes)...")
+    deadline = time.time() + max_wait_seconds
+    attempt = 0
+    since = None
+    while time.time() < deadline:
+        attempt += 1
+        remaining = int(deadline - time.time())
+        print(f"[*] Checking mailcx inbox (attempt {attempt}, {remaining}s remaining)...")
+
+        messages, next_since = get_mailcx_messages(address, since=since)
+        since = next_since or since
+        result = _scan_messages_for_credentials(messages, fetch_full=_mailcx_fetch_full)
+        if result:
+            return result
+
+        if messages:
+            print(f"[*] Found {len(messages)} email(s), but credentials email not yet received")
+        else:
+            print("[*] Inbox is empty (long-poll cycle ended, reconnecting)")
+
+    print(f"[!] Timeout: Credentials email not received after {max_wait_seconds}s")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
 # Gmail plus-addressing backend — real inbox polled over IMAP
 #
 # Each run checks out with a unique alias like wdmonitoring+55455@gmail.com;
@@ -858,6 +1089,12 @@ def create_email_session(driver=None):
             return None
         return {"backend": "gmail", "address": alias}
 
+    if IPTVV_EMAIL_BACKEND == "mailcx":
+        address = create_mailcx_inbox()
+        if not address:
+            return None
+        return {"backend": "mailcx", "address": address}
+
     # Default: tmaily.com disposable inbox.
     address = create_tmaily_inbox()
     if not address:
@@ -874,6 +1111,8 @@ def wait_for_credentials_email(driver, session, max_wait_seconds=EMAIL_MAX_WAIT_
         return _wait_for_credentials_email_procmail(session["address"], max_wait_seconds)
     if backend == "gmail":
         return _wait_for_credentials_email_gmail(session["address"], max_wait_seconds)
+    if backend == "mailcx":
+        return _wait_for_credentials_email_mailcx(session["address"], max_wait_seconds)
     return _wait_for_credentials_email_tmaily(session["address"], max_wait_seconds)
 
 
@@ -2542,10 +2781,12 @@ def run_automation():
         print("\n[*] Creating trial using public IP (direct connection)")
         print("=" * 60)
 
-        # Fail fast on Gmail credential problems before spending a browser
-        # session (checkout + captcha) that a broken inbox login would waste.
+        # Fail fast on Gmail/mail.cx credential problems before spending a
+        # browser session (checkout + captcha) that a broken inbox would waste.
         if IPTVV_EMAIL_BACKEND == "gmail":
             verify_gmail_login()
+        if IPTVV_EMAIL_BACKEND == "mailcx":
+            verify_mailcx_token()
 
         # Step 1: Initialize browser and confirm IPTVV checkout is reachable.
         driver = get_driver()
