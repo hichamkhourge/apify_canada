@@ -492,17 +492,40 @@ def _tmaily_session():
     return _tmaily_http
 
 
+def _tmaily_available_domains():
+    """Return tmaily's current mintable domains, or None if the check itself failed."""
+    try:
+        resp = _tmaily_session().get(f"{TMAILY_API_BASE}/domains", timeout=10)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        domains = data.get("domains") if isinstance(data, dict) else data
+        return list(domains) if isinstance(domains, list) else None
+    except Exception as exc:
+        print(f"[!] Could not fetch tmaily domain list: {exc}")
+        return None
+
+
 def create_tmaily_inbox():
     """Generate a disposable address via tmaily.com.
 
     Returns the email address string, or None on failure. Passes force=true so
     every call mints a fresh address instead of returning the session's
-    current one, and pins the address to TMAILY_DOMAIN when set.
+    current one, and pins the address to TMAILY_DOMAIN when set. tmaily rotates
+    its domain roster over time, so a configured TMAILY_DOMAIN that's since been
+    retired (server answers "Invalid domain selected.") falls back to a
+    tmaily-assigned domain instead of hard-failing the run.
     """
     try:
+        domain = TMAILY_DOMAIN
+        if domain:
+            available = _tmaily_available_domains()
+            if available is not None and domain not in available:
+                print(f"[!] TMAILY_DOMAIN {domain!r} is no longer offered by tmaily.com "
+                      f"(current domains: {available}); falling back to a rotating domain")
+                domain = ""
         params = {"force": "true"}
-        if TMAILY_DOMAIN:
-            params["domain"] = TMAILY_DOMAIN
+        if domain:
+            params["domain"] = domain
         resp = _tmaily_session().get(
             f"{TMAILY_API_BASE}/generate", params=params, timeout=15
         )
@@ -513,9 +536,9 @@ def create_tmaily_inbox():
         address = (data or {}).get("address", "")
         if "@" not in address:
             raise RuntimeError(f"unexpected /generate response: {str(data)[:120]!r}")
-        if TMAILY_DOMAIN and not address.endswith("@" + TMAILY_DOMAIN):
+        if domain and not address.endswith("@" + domain):
             raise RuntimeError(
-                f"tmaily returned {address!r}, not on requested domain {TMAILY_DOMAIN}"
+                f"tmaily returned {address!r}, not on requested domain {domain}"
             )
         print(f"[OK] tmaily inbox created: {address}")
         return address
