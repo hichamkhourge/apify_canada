@@ -477,6 +477,18 @@ def _tmaily_session():
     if _tmaily_http is None:
         _tmaily_http = requests.Session()
         _tmaily_http.headers.update({"User-Agent": _TMAILY_UA})
+        if IPTVV_PROXY_URL:
+            # tmaily.com is Cloudflare-fronted and appears to block the same
+            # Apify datacenter IP that iptvv.ca blocks (see IPTVV_PROXY_URL
+            # comment above) — route through the residential proxy so tmaily
+            # sees the same egress IP as the browser.
+            _tmaily_http.proxies = {"http": IPTVV_PROXY_URL, "https": IPTVV_PROXY_URL}
+            _tmaily_http.verify = False
+            try:
+                import urllib3
+                urllib3.disable_warnings()
+            except Exception:
+                pass
     return _tmaily_http
 
 
