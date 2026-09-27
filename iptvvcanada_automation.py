@@ -77,6 +77,14 @@ EMAIL_MAX_WAIT_SECONDS = int(os.getenv("IPTVV_EMAIL_MAX_WAIT_SECONDS", "2700")) 
 #                Pure HTTP: GET /generate for an address, GET /inbox/{addr} for messages.
 #   "mailtm"          — legacy mail.tm REST API (kept as a fallback).
 IPTVV_EMAIL_BACKEND = os.getenv("IPTVV_EMAIL_BACKEND", "mailcx").strip().lower()
+# Backends tried in order when the primary one fails its pre-flight check or
+# can't allocate an inbox (e.g. mail.cx 402 when the account is over quota).
+# Comma-separated; set to "" to disable fallback and fail on the primary.
+IPTVV_EMAIL_FALLBACKS = [
+    b.strip().lower()
+    for b in os.getenv("IPTVV_EMAIL_FALLBACKS", "tmaily,procmail,mailtm").split(",")
+    if b.strip()
+]
 TMAILY_API_BASE = os.getenv("TMAILY_API_BASE", "https://tmaily.com").rstrip("/")
 # Domain to mint tmaily addresses on; set to "" to let tmaily pick a random one.
 TMAILY_DOMAIN = os.getenv("TMAILY_DOMAIN", "imgcompress.io").strip()
@@ -746,10 +754,14 @@ def _mailcx_pick_domain():
 
 
 def verify_mailcx_token():
-    """Raise early with a clear error if MAILCX_API_TOKEN is missing/invalid.
+    """Check MAILCX_API_TOKEN before spending a browser session on it.
 
     GET /v1/tokens is a plain (non-long-poll) authenticated call, so this
     returns immediately instead of waiting out a 25s long-poll hold.
+
+    Returns True if the token works, False if mail.cx rejects the account
+    (401/402/403, e.g. quota exhausted or plan lapsed) so the caller can fall
+    back to another backend. Raises on a missing token or network failure.
     """
     if not MAILCX_API_TOKEN:
         raise RuntimeError(
@@ -758,10 +770,18 @@ def verify_mailcx_token():
         )
     try:
         resp = _mailcx_session().get(f"{MAILCX_API_BASE}/tokens", timeout=15)
-        resp.raise_for_status()
-        print("[OK] mail.cx API token verified")
     except Exception as exc:
         raise RuntimeError(f"mail.cx API token check failed: {exc}") from exc
+    if resp.status_code in (401, 402, 403):
+        print(f"[!] mail.cx rejected the API token (HTTP {resp.status_code}): "
+              f"{resp.text[:200].strip()}")
+        return False
+    try:
+        resp.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"mail.cx API token check failed: {exc}") from exc
+    print("[OK] mail.cx API token verified")
+    return True
 
 
 def create_mailcx_inbox():
@@ -1065,31 +1085,53 @@ def _wait_for_credentials_email_gmail(alias, max_wait_seconds=EMAIL_MAX_WAIT_SEC
 # ═══════════════════════════════════════════════════════════
 # Email backend dispatchers (backend-agnostic entry points used by main())
 # ═══════════════════════════════════════════════════════════
-def create_email_session(driver=None):
-    """Allocate a receiving address using the configured backend (IPTVV_EMAIL_BACKEND).
+def email_backend_chain():
+    """Primary backend followed by the configured fallbacks, deduplicated."""
+    chain = []
+    for backend in [IPTVV_EMAIL_BACKEND] + IPTVV_EMAIL_FALLBACKS:
+        if backend not in chain:
+            chain.append(backend)
+    return chain
 
-    Returns a session dict that always carries 'backend' and 'address', or None on
-    failure. 'driver' is accepted for API symmetry but unused by the HTTP backends.
+
+def email_backend_ready(backend):
+    """Run the backend's credential pre-flight; False means skip it.
+
+    Cheap checks only, run before the browser starts so a broken inbox
+    doesn't waste a checkout + captcha.
     """
-    if IPTVV_EMAIL_BACKEND == "mailtm":
+    try:
+        if backend == "gmail":
+            verify_gmail_login()
+        elif backend == "mailcx":
+            return verify_mailcx_token()
+    except Exception as exc:
+        print(f"[!] {backend} backend pre-flight failed: {exc}")
+        return False
+    return True
+
+
+def _create_session_for(backend):
+    """Allocate a receiving address on one backend; None on failure."""
+    if backend == "mailtm":
         address, password, auth_token = create_mailtm_account()
         if not address:
             return None
         return {"backend": "mailtm", "address": address, "password": password, "token": auth_token}
 
-    if IPTVV_EMAIL_BACKEND == "procmail":
+    if backend == "procmail":
         address = create_procmail_inbox()
         if not address:
             return None
         return {"backend": "procmail", "address": address}
 
-    if IPTVV_EMAIL_BACKEND == "gmail":
+    if backend == "gmail":
         alias = create_gmail_alias()
         if not alias:
             return None
         return {"backend": "gmail", "address": alias}
 
-    if IPTVV_EMAIL_BACKEND == "mailcx":
+    if backend == "mailcx":
         address = create_mailcx_inbox()
         if not address:
             return None
@@ -1100,6 +1142,20 @@ def create_email_session(driver=None):
     if not address:
         return None
     return {"backend": "tmaily", "address": address}
+
+
+def create_email_session(backends=None):
+    """Allocate a receiving address on the first backend that succeeds.
+
+    'backends' defaults to email_backend_chain(). Returns a session dict that
+    always carries 'backend' and 'address', or None if every backend failed.
+    """
+    for backend in backends if backends is not None else email_backend_chain():
+        session = _create_session_for(backend)
+        if session:
+            return session
+        print(f"[!] {backend} backend could not allocate an inbox, trying next backend")
+    return None
 
 
 def wait_for_credentials_email(driver, session, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
@@ -2781,12 +2837,13 @@ def run_automation():
         print("\n[*] Creating trial using public IP (direct connection)")
         print("=" * 60)
 
-        # Fail fast on Gmail/mail.cx credential problems before spending a
-        # browser session (checkout + captcha) that a broken inbox would waste.
-        if IPTVV_EMAIL_BACKEND == "gmail":
-            verify_gmail_login()
-        if IPTVV_EMAIL_BACKEND == "mailcx":
-            verify_mailcx_token()
+        # Drop backends with broken credentials (bad Gmail app password,
+        # over-quota mail.cx token, ...) before spending a browser session
+        # (checkout + captcha) that a broken inbox would waste.
+        email_backends = [b for b in email_backend_chain() if email_backend_ready(b)]
+        if not email_backends:
+            raise RuntimeError(f"No usable email backend (tried {', '.join(email_backend_chain())})")
+        print(f"[*] Email backends in order: {', '.join(email_backends)}")
 
         # Step 1: Initialize browser and confirm IPTVV checkout is reachable.
         driver = get_driver()
@@ -2798,9 +2855,9 @@ def run_automation():
         select_full_channel_package(driver)
 
         # Step 4: Allocate a receiving address only after the checkout form is reachable.
-        email_session = create_email_session(driver)
+        email_session = create_email_session(email_backends)
         if not email_session:
-            raise RuntimeError(f"Failed to create temporary email ({IPTVV_EMAIL_BACKEND} backend)")
+            raise RuntimeError(f"Failed to create temporary email (tried {', '.join(email_backends)})")
         email_address = email_session["address"]
 
         # Step 5: Fill checkout form with the temporary email
@@ -2811,7 +2868,7 @@ def run_automation():
 
         # Step 7: Wait for credentials email (this can take 5-45 minutes)
         print("\n" + "=" * 60)
-        print(f"[*] Order submitted! Monitoring {IPTVV_EMAIL_BACKEND} inbox: {email_address}")
+        print(f"[*] Order submitted! Monitoring {email_session['backend']} inbox: {email_address}")
         print("=" * 60 + "\n")
 
         credentials_message = wait_for_credentials_email(driver, email_session)

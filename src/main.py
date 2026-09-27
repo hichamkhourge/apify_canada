@@ -16,6 +16,7 @@ _ENV_MAP = {
     "twoCaptchaApiKey": "TWOCAPTCHA_API_KEY",
     "webhookAuthToken": "WEBHOOK_AUTH_TOKEN",
     "emailBackend": "IPTVV_EMAIL_BACKEND",
+    "emailFallbacks": "IPTVV_EMAIL_FALLBACKS",
     "tmailyDomain": "TMAILY_DOMAIN",
     "mailcxApiToken": "MAILCX_API_TOKEN",
     "mailcxDomain": "MAILCX_DOMAIN",

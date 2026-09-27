@@ -59,6 +59,13 @@
             "enum": ["mailcx", "tmaily", "gmail", "procmail", "mailtm"],
             "enumTitles": ["mail.cx (default)", "tmaily.com", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
         },
+        "emailFallbacks": {
+            "title": "Email fallback backends",
+            "type": "string",
+            "description": "Comma-separated backends tried in order when the primary one fails (e.g. mail.cx 402 over quota, bad Gmail app password, inbox allocation error). Allowed: mailcx, tmaily, gmail, procmail, mailtm.",
+            "editor": "textfield",
+            "default": "tmaily,procmail,mailtm"
+        },
         "mailcxApiToken": {
             "title": "mail.cx API token",
             "type": "string",
