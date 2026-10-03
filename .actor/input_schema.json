@@ -53,16 +53,16 @@
         "emailBackend": {
             "title": "Email backend",
             "type": "string",
-            "description": "Which mailbox to use for receiving the credentials email. 'mailcx' uses api.mail.cx (requires an API token below); 'tmaily' allocates a disposable tmaily.com inbox per run; 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
+            "description": "Which mailbox to use for receiving the credentials email. 'mailcx' uses api.mail.cx (requires an API token below); 'emailondeck' uses emailondeck.com (hCaptcha solved via 2captcha, so a 2captcha key is required); 'tmaily' allocates a disposable tmaily.com inbox per run; 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
             "editor": "select",
             "default": "mailcx",
-            "enum": ["mailcx", "tmaily", "gmail", "procmail", "mailtm"],
+            "enum": ["mailcx", "emailondeck", "tmaily", "gmail", "procmail", "mailtm"],
             "enumTitles": ["mail.cx (default)", "tmaily.com", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
         },
         "emailFallbacks": {
             "title": "Email fallback backends",
             "type": "string",
-            "description": "Comma-separated backends tried in order when the primary one fails (e.g. mail.cx 402 over quota, bad Gmail app password, inbox allocation error). Allowed: mailcx, tmaily, gmail, procmail, mailtm.",
+            "description": "Comma-separated backends tried in order when the primary one fails (e.g. mail.cx 402 over quota, bad Gmail app password, inbox allocation error). Allowed: mailcx, emailondeck, tmaily, gmail, procmail, mailtm.",
             "editor": "textfield",
             "default": "tmaily,procmail,mailtm"
         },

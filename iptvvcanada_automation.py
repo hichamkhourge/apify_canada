@@ -64,6 +64,8 @@ EMAIL_MAX_WAIT_SECONDS = int(os.getenv("IPTVV_EMAIL_MAX_WAIT_SECONDS", "2700")) 
 #                (MAILCX_API_TOKEN, from the mail.cx dashboard -> Tokens).
 #                GET /v1/inbox/<address> long-polls server-side for up to 25s
 #                per call, so no client-side poll loop is needed.
+#   "emailondeck"     — emailondeck.com. Address creation is behind an hCaptcha, solved
+#                with 2captcha (needs TWOCAPTCHA_API_KEY); the inbox is then plain HTTP.
 #   "tmaily"          — tmaily.com same-origin REST API. GET /generate for an
 #                address (session cookie binds the inbox), GET /emails?address=
 #                for messages. Inboxes auto-expire after 24h. Addresses are
@@ -91,6 +93,7 @@ TMAILY_DOMAIN = os.getenv("TMAILY_DOMAIN", "imgcompress.io").strip()
 PROCMAIL_API_BASE = os.getenv("PROCMAIL_API_BASE", "https://api.procmail.xyz").rstrip("/")
 MAILCX_API_BASE = os.getenv("MAILCX_API_BASE", "https://api.mail.cx/v1").rstrip("/")
 MAILCX_API_TOKEN = os.getenv("MAILCX_API_TOKEN", "").strip()
+EMAILONDECK_BASE = os.getenv("EMAILONDECK_BASE", "https://www.emailondeck.com").rstrip("/")
 # Domain to mint mailcx addresses on; leave "" to use whatever /v1/config marks default.
 MAILCX_DOMAIN = os.getenv("MAILCX_DOMAIN", "").strip()
 IPTVV_GMAIL_ADDRESS = os.getenv("IPTVV_GMAIL_ADDRESS", "wdmonitoring@gmail.com").strip()
@@ -1083,6 +1086,150 @@ def _wait_for_credentials_email_gmail(alias, max_wait_seconds=EMAIL_MAX_WAIT_SEC
 
 
 # ═══════════════════════════════════════════════════════════
+# EmailOnDeck backend — emailondeck.com, pure HTTP + 2captcha hCaptcha
+#
+#   GET  /                    -> homepage carrying an hCaptcha (data-sitekey)
+#   POST /?act=recap          -> with h-captcha-response; 302s to /eod.php, which
+#                                embeds the new address (`var email='...'`). The
+#                                PHPSESSID cookie binds the inbox, so one
+#                                requests.Session == one inbox.
+#   POST /ajax/messages.php   -> "<count>|<|>|<rows html>"; each row is a
+#                                `.msglink` element whose name= is the message id.
+#   GET  /email.php?msg_id=N  -> the message page.
+# There is no free API, and creating an address costs one 2captcha solve.
+# ═══════════════════════════════════════════════════════════
+def solve_hcaptcha_token(sitekey, page_url, attempts=2):
+    """Solve an hCaptcha through 2captcha; returns the token or None."""
+    if not TWOCAPTCHA_API_KEY:
+        print("[!] TWOCAPTCHA_API_KEY is not set, cannot solve hCaptcha")
+        return None
+    hsolver = TwoCaptcha(TWOCAPTCHA_API_KEY, defaultTimeout=300, pollingInterval=5)
+    for attempt in range(1, attempts + 1):
+        try:
+            print(f"[*] Solving hCaptcha via 2captcha (attempt {attempt}/{attempts})...")
+            return hsolver.hcaptcha(sitekey=sitekey, url=page_url)["code"]
+        except Exception as exc:
+            print(f"[!] hCaptcha solve failed: {exc}")
+    return None
+
+
+def _html_to_text(fragment):
+    fragment = re.sub(r"(?is)<(script|style).*?</\1>", " ", fragment)
+    fragment = re.sub(r"(?s)<[^>]+>", " ", fragment)
+    return re.sub(r"\s+", " ", html.unescape(fragment)).strip()
+
+
+def create_emailondeck_inbox():
+    """Solve the hCaptcha and mint an address; returns (address, requests.Session) or (None, None)."""
+    base = EMAILONDECK_BASE
+    http = requests.Session()
+    http.headers["User-Agent"] = get_random_user_agent()
+    if IPTVV_PROXY_URL:
+        http.proxies = {"http": IPTVV_PROXY_URL, "https": IPTVV_PROXY_URL}
+        http.verify = False
+    try:
+        page = http.get(f"{base}/", timeout=30)
+        page.raise_for_status()
+        match = re.search(r'data-sitekey="([^"]+)"', page.text)
+        if not match:
+            print("[!] emailondeck: no hCaptcha sitekey on the homepage")
+            return None, None
+        token = solve_hcaptcha_token(match.group(1), f"{base}/")
+        if not token:
+            return None, None
+        resp = http.post(
+            f"{base}/?act=recap",
+            data={"h-captcha-response": token, "g-recaptcha-response": token},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        found = re.search(r"var email='([^']+)'", resp.text)
+        if not found:
+            print(f"[!] emailondeck: no address in response from {resp.url}")
+            return None, None
+        address = found.group(1)
+        print(f"[OK] emailondeck inbox: {address}")
+        return address, http
+    except Exception as exc:
+        print(f"[!] Failed to create emailondeck inbox: {exc}")
+        return None, None
+
+
+def get_emailondeck_messages(http):
+    """Fetch the inbox once; returns normalized message summaries."""
+    try:
+        resp = http.post(
+            f"{EMAILONDECK_BASE}/ajax/messages.php",
+            headers={"X-Requested-With": "XMLHttpRequest"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        parts = resp.text.split("|<|>|", 1)
+        rows_html = parts[1] if len(parts) > 1 else ""
+    except Exception as exc:
+        print(f"[!] Failed to fetch emailondeck inbox: {exc}")
+        return []
+    messages = []
+    for tag in re.finditer(
+        r"""(?is)<(\w+)\b[^>]*class=["'][^"']*msglink[^"']*["'][^>]*>(.*?)</\1>""", rows_html
+    ):
+        name = re.search(r"""name=["']?(\w+)""", tag.group(0))
+        if not name:
+            continue
+        cells = [c.strip() for c in re.findall(r">([^<>]+)<", f">{tag.group(2)}<") if c.strip()]
+        whole = _html_to_text(tag.group(2))
+        sender, subject = (cells[0], cells[1]) if len(cells) >= 2 else (whole, whole)
+        messages.append({
+            "id": name.group(1),
+            "subject": html.unescape(subject),
+            "from": {"address": html.unescape(sender)},
+            "text": "",
+            "html": [],
+        })
+    return messages
+
+
+def _emailondeck_fetch_full(http):
+    def fetch(msg):
+        if msg.get("text") or msg.get("html"):
+            return msg
+        try:
+            resp = http.get(f"{EMAILONDECK_BASE}/email.php", params={"msg_id": msg["id"]}, timeout=30)
+            resp.raise_for_status()
+            full = dict(msg)
+            full["text"] = _html_to_text(resp.text)
+            full["html"] = [resp.text]
+            return full
+        except Exception as exc:
+            print(f"[!] Failed to fetch emailondeck message {msg.get('id')}: {exc}")
+            return msg
+    return fetch
+
+
+def _wait_for_credentials_email_emailondeck(http, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
+    """Poll the emailondeck inbox until the credentials email arrives."""
+    print(f"[*] Waiting for credentials email (max {max_wait_seconds}s / {max_wait_seconds//60} minutes)...")
+    deadline = time.time() + max_wait_seconds
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        remaining = int(deadline - time.time())
+        print(f"[*] Checking emailondeck inbox (attempt {attempt}, {remaining}s remaining)...")
+        messages = get_emailondeck_messages(http)
+        result = _scan_messages_for_credentials(messages, fetch_full=_emailondeck_fetch_full(http))
+        if result:
+            return result
+        if messages:
+            print(f"[*] Found {len(messages)} email(s), but credentials email not yet received")
+        else:
+            print("[*] Inbox is empty")
+        time.sleep(min(EMAIL_POLL_SECONDS, max(0, deadline - time.time())))
+
+    print(f"[!] Timeout: Credentials email not received after {max_wait_seconds}s")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
 # Email backend dispatchers (backend-agnostic entry points used by main())
 # ═══════════════════════════════════════════════════════════
 def email_backend_chain():
@@ -1105,6 +1252,9 @@ def email_backend_ready(backend):
             verify_gmail_login()
         elif backend == "mailcx":
             return verify_mailcx_token()
+        elif backend == "emailondeck":
+            if not TWOCAPTCHA_API_KEY:
+                raise RuntimeError("TWOCAPTCHA_API_KEY is required for emailondeck")
     except Exception as exc:
         print(f"[!] {backend} backend pre-flight failed: {exc}")
         return False
@@ -1136,6 +1286,12 @@ def _create_session_for(backend):
         if not address:
             return None
         return {"backend": "mailcx", "address": address}
+
+    if backend == "emailondeck":
+        address, http = create_emailondeck_inbox()
+        if not address:
+            return None
+        return {"backend": "emailondeck", "address": address, "http": http}
 
     # Default: tmaily.com disposable inbox.
     address = create_tmaily_inbox()
@@ -1169,6 +1325,8 @@ def wait_for_credentials_email(driver, session, max_wait_seconds=EMAIL_MAX_WAIT_
         return _wait_for_credentials_email_gmail(session["address"], max_wait_seconds)
     if backend == "mailcx":
         return _wait_for_credentials_email_mailcx(session["address"], max_wait_seconds)
+    if backend == "emailondeck":
+        return _wait_for_credentials_email_emailondeck(session["http"], max_wait_seconds)
     return _wait_for_credentials_email_tmaily(session["address"], max_wait_seconds)
 
 
