@@ -1095,7 +1095,7 @@ def _wait_for_credentials_email_gmail(alias, max_wait_seconds=EMAIL_MAX_WAIT_SEC
 #                                requests.Session == one inbox.
 #   POST /ajax/messages.php   -> "<count>|<|>|<rows html>"; each row is a
 #                                `.msglink` element whose name= is the message id.
-#   GET  /email.php?msg_id=N  -> the message page.
+#   GET  /email_iframe.php?msg_id=N -> the message body (email.php only wraps it in an iframe).
 # There is no free API, and creating an address costs one 2captcha solve.
 # ═══════════════════════════════════════════════════════════
 def solve_hcaptcha_token(sitekey, page_url, attempts=2):
@@ -1194,7 +1194,8 @@ def _emailondeck_fetch_full(http):
         if msg.get("text") or msg.get("html"):
             return msg
         try:
-            resp = http.get(f"{EMAILONDECK_BASE}/email.php", params={"msg_id": msg["id"]}, timeout=30)
+            # email.php is just site chrome; the message body lives in its iframe.
+            resp = http.get(f"{EMAILONDECK_BASE}/email_iframe.php", params={"msg_id": msg["id"]}, timeout=30)
             resp.raise_for_status()
             full = dict(msg)
             full["text"] = _html_to_text(resp.text)
